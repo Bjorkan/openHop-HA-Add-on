@@ -54,7 +54,7 @@ case "${STOP_REQUESTED}" in
     *) fatal "OPENHOP_ADDON_STOP_REQUESTED must be true or false" ;;
 esac
 # Invoked indirectly by the TERM/INT trap below.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 forward_stop() {
     STOP_REQUESTED=true
     export OPENHOP_ADDON_STOP_REQUESTED=true
