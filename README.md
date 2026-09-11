@@ -36,8 +36,9 @@ Inside the app, the same file is available as:
 ```
 
 Home Assistant app options select which upstream code runs (`branch_or_pr`,
-for example `main` or `42`). The YAML file is the only source of repeater
-settings.
+for example `main` or `42`, plus the optional `core_branch_or_pr` override
+for `openhop-dev/openhop_core`). The YAML file is the only source of
+repeater settings.
 
 ## Branch / PR selection
 

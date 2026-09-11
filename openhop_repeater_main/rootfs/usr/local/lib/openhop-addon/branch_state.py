@@ -16,19 +16,63 @@ _PR_BARE_NUMBER = re.compile(r"^(\d+)$")
 _PR_HASHED_NUMBER = re.compile(r"^#(\d+)$")
 _PR_PREFIXED_NUMBER = re.compile(r"(?i)^pr[\s#\-_]*#?[\s#\-_]*(\d+)$")
 _PR_REF = re.compile(r"(?i)^(?:refs/)?pull/(\d+)(?:/(head|merge))?$")
-_OPTIONS_KEY = "branch_or_pr"
-_OPTIONS_ENV_OVERRIDE = "OPENHOP_ADDON_SOURCE_REF"
-_OPTIONS_DEFAULT = "main"
 _OPTIONS_DEFAULT_PATH = Path("/data/options.json")
-_DIST_INFO_GLOB = "openhop_repeater-*.dist-info/direct_url.json"
-_ALLOWED_REPOSITORY_URLS = {
-    "https://github.com/openhop-dev/openhop_repeater",
-    "https://github.com/openhop-dev/openhop_repeater.git",
+
+# Per-package source configuration. ``default`` is selected when the option
+# is missing or empty; ``allow_empty`` marks options where an empty value is
+# a valid "no override" selection instead of falling back silently.
+_PACKAGES = {
+    "repeater": {
+        "dist_glob": "openhop_repeater-*.dist-info/direct_url.json",
+        "repo_urls": frozenset(
+            {
+                "https://github.com/openhop-dev/openhop_repeater",
+                "https://github.com/openhop-dev/openhop_repeater.git",
+            }
+        ),
+        "pip_prefix": (
+            "openhop_repeater[hardware] @ "
+            "git+https://github.com/openhop-dev/openhop_repeater.git@"
+        ),
+        "options_key": "branch_or_pr",
+        "env_override": "OPENHOP_ADDON_SOURCE_REF",
+        "default": "main",
+        "allow_empty": False,
+    },
+    "core": {
+        "dist_glob": "openhop_core-*.dist-info/direct_url.json",
+        "repo_urls": frozenset(
+            {
+                "https://github.com/openhop-dev/openhop_core",
+                "https://github.com/openhop-dev/openhop_core.git",
+            }
+        ),
+        "pip_prefix": (
+            "openhop_core[hardware] @ "
+            "git+https://github.com/openhop-dev/openhop_core.git@"
+        ),
+        "options_key": "core_branch_or_pr",
+        "env_override": "OPENHOP_ADDON_CORE_REF",
+        "default": "",
+        "allow_empty": True,
+    },
 }
-_PIP_INSTALL_PREFIX = (
-    "openhop_repeater[hardware] @ "
-    "git+https://github.com/openhop-dev/openhop_repeater.git@"
-)
+
+
+def _package(name: str) -> dict[str, object]:
+    try:
+        return _PACKAGES[name]  # type: ignore[return-value]
+    except KeyError:
+        raise ValueError(f"unknown package {name!r}") from None
+
+
+# Backwards-compatible aliases for the repeater package.
+_OPTIONS_KEY = str(_PACKAGES["repeater"]["options_key"])
+_OPTIONS_ENV_OVERRIDE = str(_PACKAGES["repeater"]["env_override"])
+_OPTIONS_DEFAULT = str(_PACKAGES["repeater"]["default"])
+_DIST_INFO_GLOB = str(_PACKAGES["repeater"]["dist_glob"])
+_ALLOWED_REPOSITORY_URLS = _PACKAGES["repeater"]["repo_urls"]
+_PIP_INSTALL_PREFIX = str(_PACKAGES["repeater"]["pip_prefix"])
 
 
 def _is_valid_pull_number(number: str) -> bool:
@@ -112,38 +156,45 @@ def looks_like_pr(value: str) -> bool:
     return value.startswith("refs/pull/")
 
 
-def read_desired_ref(options_path: Path | str | None = None) -> str:
+def read_desired_ref(
+    options_path: Path | str | None = None, package: str = "repeater"
+) -> str:
     """Read the requested branch/PR from Home Assistant app options.
 
     Lenient wrapper around :func:`resolve_desired_ref`: a missing options
-    file, a missing ``branch_or_pr`` key, or an empty value selects the
-    default branch. Invalid explicit values also fall back to the default
-    here; bootstraps that must refuse to start should use
+    file, a missing option key, or an empty value selects the package
+    default. Invalid explicit values also fall back to the default here;
+    bootstraps that must refuse to start should use
     :func:`resolve_desired_ref` and honor its error.
     """
-    ref, _ = resolve_desired_ref(options_path)
+    ref, _ = resolve_desired_ref(options_path, package)
     return ref
 
 
 def resolve_desired_ref(
-    options_path: Path | str | None = None,
+    options_path: Path | str | None = None, package: str = "repeater"
 ) -> tuple[str, str | None]:
     """Resolve the requested branch/PR, returning ``(ref, error)``.
 
     ``error`` is ``None`` on success. A missing options file, a missing
-    ``branch_or_pr`` key, or an empty value selects the default branch. An
-    explicitly configured value that cannot be normalized is an error: the
-    caller should refuse to start rather than silently run other code.
-    ``OPENHOP_ADDON_SOURCE_REF`` overrides the options file so tests and
-    local runs can inject a value.
+    option key, or an empty value selects the package default (``main`` for
+    the repeater, no core override for ``core``). An explicitly configured
+    value that cannot be normalized is an error: the caller should refuse to
+    start rather than silently run other code. ``OPENHOP_ADDON_SOURCE_REF``
+    (repeater) and ``OPENHOP_ADDON_CORE_REF`` (core) override the options
+    file so tests and local runs can inject a value.
     """
-    override_env = (os.environ.get(_OPTIONS_ENV_OVERRIDE) or "").strip()
+    config = _package(package)
+    options_key = str(config["options_key"])
+    env_override = str(config["env_override"])
+    default = str(config["default"])
+    override_env = (os.environ.get(env_override) or "").strip()
     if override_env:
         normalized = normalize_source_ref(override_env)
         if not normalized:
             return (
-                _OPTIONS_DEFAULT,
-                f"invalid {_OPTIONS_ENV_OVERRIDE} value {override_env!r}: "
+                default,
+                f"invalid {env_override} value {override_env!r}: "
                 "use a branch name (for example 'main') or a pull-request "
                 "number (for example '42')",
             )
@@ -156,19 +207,19 @@ def resolve_desired_ref(
     try:
         data = json.loads(options_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return (_OPTIONS_DEFAULT, None)
+        return (default, None)
     if not isinstance(data, dict):
-        return (_OPTIONS_DEFAULT, None)
-    raw = data.get(_OPTIONS_KEY)
+        return (default, None)
+    raw = data.get(options_key)
     if raw is None:
-        return (_OPTIONS_DEFAULT, None)
+        return (default, None)
     if isinstance(raw, str) and not raw.strip():
-        return (_OPTIONS_DEFAULT, None)
+        return (default, None)
     normalized = normalize_source_ref(raw)
     if not normalized:
         return (
-            _OPTIONS_DEFAULT,
-            f"invalid '{_OPTIONS_KEY}' app option {raw!r} in {options_file}: "
+            default,
+            f"invalid '{options_key}' app option {raw!r} in {options_file}: "
             "use a branch name (for example 'main') or a pull-request "
             "number (for example '42')",
         )
@@ -207,9 +258,12 @@ def is_valid_source_ref(ref: str) -> bool:
     return is_valid_git_ref(ref)
 
 
-def _candidate_direct_urls(site_packages: Path) -> Iterable[Path]:
+def _candidate_direct_urls(
+    site_packages: Path, package: str = "repeater"
+) -> Iterable[Path]:
+    glob = str(_package(package)["dist_glob"])
     candidates: list[tuple[int, Path]] = []
-    for path in site_packages.glob(_DIST_INFO_GLOB):
+    for path in site_packages.glob(glob):
         try:
             modified = path.stat().st_mtime_ns
         except OSError:
@@ -219,16 +273,18 @@ def _candidate_direct_urls(site_packages: Path) -> Iterable[Path]:
     return (path for _, path in ordered)
 
 
-def installed_ref(site_packages: Path) -> str:
+def installed_ref(site_packages: Path, package: str = "repeater") -> str:
     """Return the requested VCS revision for the newest installed distribution."""
-    for direct_url_path in _candidate_direct_urls(site_packages):
+    allowed_urls = _package(package)["repo_urls"]
+    assert isinstance(allowed_urls, frozenset)
+    for direct_url_path in _candidate_direct_urls(site_packages, package):
         try:
             data = json.loads(direct_url_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
 
         url = str(data.get("url", "")).lower().rstrip("/")
-        if url not in _ALLOWED_REPOSITORY_URLS:
+        if url not in allowed_urls:
             continue
 
         vcs_info = data.get("vcs_info")
@@ -263,9 +319,11 @@ def are_safe_pip_args(args: list[str]) -> bool:
         return False
 
     install_spec = args[-1]
-    if not install_spec.startswith(_PIP_INSTALL_PREFIX):
-        return False
-    return is_valid_source_ref(install_spec[len(_PIP_INSTALL_PREFIX) :])
+    for package in ("repeater", "core"):
+        prefix = str(_package(package)["pip_prefix"])
+        if install_spec.startswith(prefix):
+            return is_valid_source_ref(install_spec[len(prefix) :])
+    return False
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -293,9 +351,30 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit non-zero when the configured value is invalid",
     )
+    desired.add_argument(
+        "--package",
+        dest="package",
+        choices=sorted(_PACKAGES),
+        default="repeater",
+    )
 
     installed = subparsers.add_parser("installed-ref")
     installed.add_argument("site_packages", type=Path)
+    installed.add_argument(
+        "--package",
+        dest="package",
+        choices=sorted(_PACKAGES),
+        default="repeater",
+    )
+
+    install_spec_parser = subparsers.add_parser("install-spec")
+    install_spec_parser.add_argument(
+        "--package",
+        dest="package",
+        choices=sorted(_PACKAGES),
+        default="repeater",
+    )
+    install_spec_parser.add_argument("ref")
 
     return parser
 
@@ -319,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         print(normalized)
         return 0
     if args.command == "desired-ref":
-        ref, error = resolve_desired_ref(args.options)
+        ref, error = resolve_desired_ref(args.options, args.package)
         if error is not None:
             print(error, file=sys.stderr)
             if args.strict:
@@ -327,7 +406,13 @@ def main(argv: list[str] | None = None) -> int:
         print(ref)
         return 0
     if args.command == "installed-ref":
-        print(installed_ref(args.site_packages))
+        print(installed_ref(args.site_packages, args.package))
+        return 0
+    if args.command == "install-spec":
+        if not is_valid_source_ref(args.ref):
+            print(f"invalid source ref {args.ref!r}", file=sys.stderr)
+            return 1
+        print(f"{_package(args.package)['pip_prefix']}{args.ref}")
         return 0
     return 2
 

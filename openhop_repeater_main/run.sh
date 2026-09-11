@@ -31,6 +31,7 @@ RUNTIME_INFO_HELPER="${OPENHOP_ADDON_RUNTIME_INFO_HELPER:-/usr/local/lib/openhop
 SYSTEM_PYTHON="${OPENHOP_ADDON_SYSTEM_PYTHON:-$(command -v python3)}"
 BASE_SITE_PACKAGES_GLOB="${OPENHOP_ADDON_BASE_SITE_PACKAGES_GLOB:-/home/*/.local/lib/python*/site-packages}"
 UPSTREAM_GIT_URL="https://github.com/openhop-dev/openhop_repeater.git"
+CORE_GIT_URL="https://github.com/openhop-dev/openhop_core.git"
 DEFAULT_BRANCH="${OPENHOP_ADDON_DEFAULT_BRANCH:-main}"
 ADDON_BUILD_VERSION="${OPENHOP_ADDON_BUILD_VERSION:-unknown}"
 BASE_IMAGE_ID_FILE="${OPENHOP_ADDON_BASE_IMAGE_ID_FILE:-/usr/share/openhop-repeater/base-image-id}"
@@ -81,6 +82,7 @@ CONFIG_FILE="${ADDON_CONFIG_DIR}/config.yaml"
 VENV_DIR="${DATA_DIR}/venv"
 PYTHON_MARKER="${VENV_DIR}/.openhop-ha-python"
 BRANCH_MARKER="${VENV_DIR}/.openhop-ha-branch"
+CORE_MARKER="${VENV_DIR}/.openhop-ha-core"
 OPTIONS_FILE="${OPENHOP_ADDON_OPTIONS_FILE:-/data/options.json}"
 LEGACY_CHANNEL_FILE="${DATA_DIR}/.update_channel"
 
@@ -464,14 +466,25 @@ fi
 if [ -n "${OPENHOP_ADDON_SOURCE_REF:-}" ]; then
     SELECTED_REF="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" normalize "${OPENHOP_ADDON_SOURCE_REF}")" \
         || fatal "invalid OPENHOP_ADDON_SOURCE_REF value '${OPENHOP_ADDON_SOURCE_REF}': use a branch name (for example 'main') or a pull-request number (for example '42')"
+    SELECTED_CORE_REF=""
 elif [ ! -f "${OPTIONS_FILE}" ]; then
     SELECTED_REF="${DEFAULT_BRANCH}"
+    SELECTED_CORE_REF=""
 else
-    SELECTED_REF="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" desired-ref --strict --options "${OPTIONS_FILE}")" \
+    SELECTED_REF="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" desired-ref --strict --package repeater --options "${OPTIONS_FILE}")" \
         || fatal "invalid 'branch_or_pr' app option in ${OPTIONS_FILE}: use a branch name (for example 'main') or a pull-request number (for example '42')"
+    SELECTED_CORE_REF="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" desired-ref --strict --package core --options "${OPTIONS_FILE}")" \
+        || fatal "invalid 'core_branch_or_pr' app option in ${OPTIONS_FILE}: use a branch name (for example 'main'), a pull-request number (for example '7'), or leave it empty"
+fi
+if [ -n "${OPENHOP_ADDON_CORE_REF:-}" ]; then
+    SELECTED_CORE_REF="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" normalize "${OPENHOP_ADDON_CORE_REF}")" \
+        || fatal "invalid OPENHOP_ADDON_CORE_REF value '${OPENHOP_ADDON_CORE_REF}': use a branch name (for example 'main') or a pull-request number (for example '7')"
 fi
 if ! "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" validate-source "${SELECTED_REF}"; then
     fatal "invalid requested source ref '${SELECTED_REF}'"
+fi
+if [ -n "${SELECTED_CORE_REF}" ] && ! "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" validate-source "${SELECTED_CORE_REF}"; then
+    fatal "invalid requested core source ref '${SELECTED_CORE_REF}'"
 fi
 SELECTED_BRANCH="${SELECTED_REF}"
 if [ -f "${LEGACY_CHANNEL_FILE}" ]; then
@@ -482,7 +495,11 @@ if [ -f "${LEGACY_CHANNEL_FILE}" ]; then
 fi
 
 detected_installed_branch() {
-    "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" installed-ref "${VENV_SITE_PACKAGES}"
+    "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" installed-ref --package repeater "${VENV_SITE_PACKAGES}"
+}
+
+detected_installed_core() {
+    "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" installed-ref --package core "${VENV_SITE_PACKAGES}"
 }
 
 read_branch_marker() {
@@ -505,6 +522,32 @@ write_branch_marker() {
         rm -f "${marker_tmp}"
         fatal "could not persist verified installed branch '${branch}'"
     fi
+}
+
+read_core_marker() {
+    marker_core=""
+    if [ -r "${CORE_MARKER}" ]; then
+        marker_core="$(head -n 1 "${CORE_MARKER}" 2>/dev/null | tr -d '\r\n' || true)"
+        if [ -n "${marker_core}" ] && ! "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" validate-source "${marker_core}"; then
+            warn "discarding invalid installed-core marker '${marker_core}'"
+            marker_core=""
+            rm -f "${CORE_MARKER}"
+        fi
+    fi
+    printf '%s\n' "${marker_core}"
+}
+
+write_core_marker() {
+    core="$1"
+    marker_tmp="${CORE_MARKER}.tmp.$$"
+    if ! printf '%s\n' "${core}" > "${marker_tmp}" || ! mv -f "${marker_tmp}" "${CORE_MARKER}"; then
+        rm -f "${marker_tmp}"
+        fatal "could not persist verified installed core '${core}'"
+    fi
+}
+
+clear_core_marker() {
+    rm -f "${CORE_MARKER}"
 }
 
 can_import_repeater() {
@@ -534,6 +577,12 @@ fail_source_install() {
     fatal "could not install requested source '${ref}' from ${UPSTREAM_GIT_URL} (${detail}); refusing to start with other code"
 }
 
+fail_core_install() {
+    ref="$1"
+    detail="$2"
+    fatal "could not install requested openhop_core source '${ref}' from ${CORE_GIT_URL} (${detail}); refusing to start with other code"
+}
+
 # Read installation metadata before importing repeater.main. Importing the web
 # package runs upstream dist-info cleanup, which may remove direct_url.json when
 # a packaged distribution and a newly installed source report competing
@@ -541,6 +590,8 @@ fail_source_install() {
 # successful install instead of needlessly reinstalling it.
 DETECTED_BRANCH="$(detected_installed_branch)"
 MARKED_BRANCH="$(read_branch_marker)"
+DETECTED_CORE="$(detected_installed_core)"
+MARKED_CORE="$(read_core_marker)"
 
 # A failed or interrupted pip operation can leave the persistent venv in a
 # partially uninstalled state. Recover deterministically rather than trusting
@@ -548,10 +599,13 @@ MARKED_BRANCH="$(read_branch_marker)"
 # Recovery is only safe while the venv has no verified requested ref yet; it
 # can never fall back to other code once a ref was requested.
 if ! can_import_repeater; then
-    if [ -z "${DETECTED_BRANCH}" ] && [ -z "${MARKED_BRANCH}" ]; then
+    if [ -z "${DETECTED_BRANCH}" ] && [ -z "${MARKED_BRANCH}" ] \
+        && [ -z "${SELECTED_CORE_REF}" ]; then
         reset_to_packaged_runtime "the persistent update environment is not runnable"
         DETECTED_BRANCH=""
         MARKED_BRANCH=""
+        DETECTED_CORE=""
+        MARKED_CORE=""
     else
         fatal "the persistent update environment is not runnable; refusing to start with other code"
     fi
@@ -596,7 +650,8 @@ fi
 
 if [ "${NEEDS_BRANCH_INSTALL}" = "true" ]; then
     log "installing requested source '${SELECTED_BRANCH}' from ${UPSTREAM_GIT_URL}"
-    INSTALL_SPEC="openhop_repeater[hardware] @ git+${UPSTREAM_GIT_URL}@${SELECTED_BRANCH}"
+    INSTALL_SPEC="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" install-spec --package repeater "${SELECTED_BRANCH}")" \
+        || fatal "invalid requested source ref '${SELECTED_BRANCH}'"
     INSTALL_VERIFIED=false
     if GIT_TERMINAL_PROMPT=0 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_DEFAULT_TIMEOUT=30 \
         "${VENV_PIP}" install --upgrade --force-reinstall --no-cache-dir "${INSTALL_SPEC}"; then
@@ -620,6 +675,53 @@ if [ "${NEEDS_BRANCH_INSTALL}" = "true" ]; then
     fi
 fi
 
+# Install the requested openhop_core override after the repeater so the
+# repeater's own pinned core dependency cannot silently win. An empty
+# core option means no override: any core marker left from an earlier run
+# is cleared and the repeater install decides which core is present.
+if [ -n "${DETECTED_CORE}" ]; then
+    INSTALLED_CORE="${DETECTED_CORE}"
+else
+    INSTALLED_CORE="${MARKED_CORE}"
+fi
+NEEDS_CORE_INSTALL=false
+if [ -z "${SELECTED_CORE_REF}" ]; then
+    if [ -n "${INSTALLED_CORE}" ]; then
+        clear_core_marker
+        INSTALLED_CORE=""
+        MARKED_CORE=""
+        DETECTED_CORE=""
+    fi
+elif [ "${INSTALLED_CORE}" != "${SELECTED_CORE_REF}" ]; then
+    NEEDS_CORE_INSTALL=true
+fi
+
+if [ "${NEEDS_CORE_INSTALL}" = "true" ]; then
+    log "installing requested openhop_core source '${SELECTED_CORE_REF}' from ${CORE_GIT_URL}"
+    CORE_SPEC="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" install-spec --package core "${SELECTED_CORE_REF}")" \
+        || fatal "invalid requested core source ref '${SELECTED_CORE_REF}'"
+    CORE_VERIFIED=false
+    if GIT_TERMINAL_PROMPT=0 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_DEFAULT_TIMEOUT=30 \
+        "${VENV_PIP}" install --upgrade --force-reinstall --no-cache-dir "${CORE_SPEC}"; then
+        DETECTED_CORE="$(detected_installed_core)"
+        if [ "${DETECTED_CORE}" = "${SELECTED_CORE_REF}" ] \
+            && can_import_repeater; then
+            write_core_marker "${SELECTED_CORE_REF}"
+            INSTALLED_CORE="${SELECTED_CORE_REF}"
+            CORE_VERIFIED=true
+            log "installed and verified openhop_core source '${SELECTED_CORE_REF}'"
+        else
+            fail_core_install "${SELECTED_CORE_REF}" "runtime verification failed"
+        fi
+    else
+        fail_core_install "${SELECTED_CORE_REF}" "pip install failed"
+    fi
+
+    if [ "${CORE_VERIFIED}" != "true" ]; then
+        fail_core_install "${SELECTED_CORE_REF}" "installation could not be verified"
+    fi
+fi
+
 if ! can_import_repeater; then
     fatal "openHop Repeater cannot be imported from either the persistent venv or the protected base image"
 fi
@@ -640,8 +742,20 @@ if [ "${ACTIVE_BRANCH}" != "${SELECTED_BRANCH}" ] \
     && [ "${ACTIVE_BRANCH}" != "${DEFAULT_BRANCH} (packaged image)" ]; then
     fail_source_install "${SELECTED_BRANCH}" "active source '${ACTIVE_BRANCH}' does not match the requested source"
 fi
+if [ -n "${SELECTED_CORE_REF}" ]; then
+    ACTIVE_CORE="$(detected_installed_core)"
+    if [ -z "${ACTIVE_CORE}" ]; then
+        ACTIVE_CORE="$(read_core_marker)"
+    fi
+    if [ "${ACTIVE_CORE}" != "${SELECTED_CORE_REF}" ]; then
+        fail_core_install "${SELECTED_CORE_REF}" "active core '${ACTIVE_CORE:-none}' does not match the requested core"
+    fi
+else
+    ACTIVE_CORE="pinned by repeater install"
+fi
 ACTIVE_VERSION="$("${VENV_PYTHON}" -c 'import repeater; print(getattr(repeater, "__version__", "unknown"))')"
 log "selected source: ${SELECTED_BRANCH}; active source: ${ACTIVE_BRANCH}; version: ${ACTIVE_VERSION}"
+log "selected core: ${SELECTED_CORE_REF:-<pinned>}; active core: ${ACTIVE_CORE}"
 log "runtime package: ${IMPORT_PATH}"
 
 replace_directory_with_symlink "${RUNTIME_CONFIG_DIR}" "${ADDON_CONFIG_DIR}" false

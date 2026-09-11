@@ -70,17 +70,22 @@ def validate_app(app: Path) -> str:
     if not SEMVER.fullmatch(str(metadata.get("version", ""))):
         fail(f"{app.name}: version must be semantic versioning")
     schema = metadata.get("schema")
-    if not isinstance(schema, dict) or schema != {"branch_or_pr": "str"}:
+    if not isinstance(schema, dict) or schema != {
+        "branch_or_pr": "str",
+        "core_branch_or_pr": "str?",
+    }:
         fail(
-            f"{app.name}: schema must declare exactly the branch_or_pr option, "
-            "got {!r}".format(schema)
+            f"{app.name}: schema must declare the branch_or_pr and "
+            "core_branch_or_pr options, got {!r}".format(schema)
         )
     options = metadata.get("options")
-    if not isinstance(options, dict) or options != {"branch_or_pr": "main"}:
+    if not isinstance(options, dict) or options != {
+        "branch_or_pr": "main",
+        "core_branch_or_pr": "",
+    }:
         fail(
-            f"{app.name}: options must default branch_or_pr to main, got {{!r}}".format(
-                options
-            )
+            f"{app.name}: options must default branch_or_pr to main and "
+            "core_branch_or_pr to empty, got {!r}".format(options)
         )
     if metadata.get("init") is not True:
         fail(f"{app.name}: Home Assistant's default container init must remain enabled")
@@ -155,9 +160,14 @@ def validate_app(app: Path) -> str:
         "OPENHOP_ADDON_BASE_RUNTIME_DIR",
         "OPENHOP_ADDON_OPTIONS_FILE",
         "OPENHOP_ADDON_SOURCE_REF",
+        "OPENHOP_ADDON_CORE_REF",
+        "CORE_GIT_URL",
+        "CORE_MARKER",
         "desired-ref --strict",
+        "install-spec",
         "validate-source",
         "branch_or_pr",
+        "core_branch_or_pr",
         "RUNTIME_COMPATIBILITY",
         ".openhop-ha-branch",
         "runtime_uses_venv",
@@ -223,7 +233,11 @@ def validate_app(app: Path) -> str:
         "is_valid_source_ref",
         "refs/pull/",
         "branch_or_pr",
+        "core_branch_or_pr",
+        "openhop_core",
         "desired-ref",
+        "install-spec",
+        "installed-ref",
         "validate-source",
     ):
         if required_fragment not in helper_source:
@@ -235,11 +249,17 @@ def validate_app(app: Path) -> str:
     if not isinstance(translations, dict):
         fail(f"{app.name}/translations/en.yaml must contain a mapping")
     configuration = translations.get("configuration")
-    branch_label = (
-        configuration.get("branch_or_pr") if isinstance(configuration, dict) else None
-    )
-    if not isinstance(branch_label, dict) or not branch_label.get("name"):
-        fail(f"{app.name}/translations/en.yaml must name the branch_or_pr option")
+    for option_key in ("branch_or_pr", "core_branch_or_pr"):
+        label = (
+            configuration.get(option_key)
+            if isinstance(configuration, dict)
+            else None
+        )
+        if not isinstance(label, dict) or not label.get("name"):
+            fail(
+                f"{app.name}/translations/en.yaml must name the "
+                f"{option_key} option"
+            )
 
     invalid_terms = ("app_config", "app_configs")
     text_files = [

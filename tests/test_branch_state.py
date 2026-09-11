@@ -161,7 +161,9 @@ class DesiredRefTests(unittest.TestCase):
             root = Path(temp_dir)
             options = self._write_options(root, {"branch_or_pr": "dev"})
             old = os.environ.get("OPENHOP_ADDON_SOURCE_REF")
+            old_core = os.environ.get("OPENHOP_ADDON_CORE_REF")
             os.environ["OPENHOP_ADDON_SOURCE_REF"] = "43"
+            os.environ.pop("OPENHOP_ADDON_CORE_REF", None)
             try:
                 self.assertEqual(
                     branch_state.read_desired_ref(options), "refs/pull/43/head"
@@ -174,6 +176,8 @@ class DesiredRefTests(unittest.TestCase):
                     del os.environ["OPENHOP_ADDON_SOURCE_REF"]
                 else:
                     os.environ["OPENHOP_ADDON_SOURCE_REF"] = old
+                if old_core is not None:
+                    os.environ["OPENHOP_ADDON_CORE_REF"] = old_core
 
     def test_desired_ref_cli_strict_fails_on_invalid_option(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -181,6 +185,7 @@ class DesiredRefTests(unittest.TestCase):
             options = self._write_options(root, {"branch_or_pr": "bogus branch!!"})
             env = os.environ.copy()
             env.pop("OPENHOP_ADDON_SOURCE_REF", None)
+            env.pop("OPENHOP_ADDON_CORE_REF", None)
             result = subprocess.run(
                 [
                     sys.executable,
@@ -198,6 +203,121 @@ class DesiredRefTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 1)
             self.assertIn("branch_or_pr", result.stderr)
+
+
+class CoreOptionTests(unittest.TestCase):
+    def _write_options(self, directory: Path, payload: object) -> Path:
+        options = directory / "options.json"
+        options.write_text(json.dumps(payload), encoding="utf-8")
+        return options
+
+    def test_core_defaults_to_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.assertEqual(
+                branch_state.read_desired_ref(root / "missing.json", "core"), ""
+            )
+            self.assertEqual(
+                branch_state.read_desired_ref(
+                    self._write_options(root, {"branch_or_pr": "dev"}), "core"
+                ),
+                "",
+            )
+            self.assertEqual(
+                branch_state.read_desired_ref(
+                    self._write_options(root, {"core_branch_or_pr": "  "}), "core"
+                ),
+                "",
+            )
+
+    def test_core_reads_branch_and_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.assertEqual(
+                branch_state.read_desired_ref(
+                    self._write_options(root, {"core_branch_or_pr": "dev"}), "core"
+                ),
+                "dev",
+            )
+            self.assertEqual(
+                branch_state.read_desired_ref(
+                    self._write_options(root, {"core_branch_or_pr": 7}), "core"
+                ),
+                "refs/pull/7/head",
+            )
+            ref, error = branch_state.resolve_desired_ref(
+                self._write_options(root, {"core_branch_or_pr": "bogus!!"}), "core"
+            )
+            self.assertEqual(ref, "")
+            self.assertIsNotNone(error)
+            self.assertIn("core_branch_or_pr", error or "")
+
+    def test_core_env_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            options = self._write_options(root, {"core_branch_or_pr": "dev"})
+            old_core = os.environ.get("OPENHOP_ADDON_CORE_REF")
+            old_repeater = os.environ.get("OPENHOP_ADDON_SOURCE_REF")
+            os.environ.pop("OPENHOP_ADDON_SOURCE_REF", None)
+            os.environ["OPENHOP_ADDON_CORE_REF"] = "8"
+            try:
+                self.assertEqual(
+                    branch_state.read_desired_ref(options, "core"),
+                    "refs/pull/8/head",
+                )
+                # The repeater resolution is unaffected by the core override.
+                self.assertEqual(branch_state.read_desired_ref(options), "main")
+            finally:
+                if old_core is None:
+                    os.environ.pop("OPENHOP_ADDON_CORE_REF", None)
+                else:
+                    os.environ["OPENHOP_ADDON_CORE_REF"] = old_core
+                if old_repeater is not None:
+                    os.environ["OPENHOP_ADDON_SOURCE_REF"] = old_repeater
+
+    def test_install_spec_supports_both_packages(self) -> None:
+        self.assertEqual(
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "install-spec",
+                    "--package",
+                    "core",
+                    "refs/pull/7/head",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            ).stdout.strip(),
+            "openhop_core[hardware] @ "
+            "git+https://github.com/openhop-dev/openhop_core.git@refs/pull/7/head",
+        )
+
+    def test_installed_ref_supports_core(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "openhop_core-1.0.0.dist-info" / "direct_url.json"
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                json.dumps(
+                    {
+                        "url": "https://github.com/openhop-dev/openhop_core.git",
+                        "vcs_info": {
+                            "vcs": "git",
+                            "requested_revision": "refs/pull/7/head",
+                            "commit_id": "0" * 40,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                branch_state.installed_ref(root, "core"), "refs/pull/7/head"
+            )
+            # The repeater lookup ignores core distributions.
+            self.assertEqual(branch_state.installed_ref(root), "")
 
 
 class PipArgumentValidationTests(unittest.TestCase):
@@ -228,6 +348,33 @@ class PipArgumentValidationTests(unittest.TestCase):
                     "--force-reinstall",
                     "--no-cache-dir",
                     install_spec,
+                ]
+            )
+        )
+
+    def test_accepts_core_installs(self) -> None:
+        self.assertTrue(
+            branch_state.are_safe_pip_args(
+                [
+                    "install",
+                    "--upgrade",
+                    "--force-reinstall",
+                    "--no-cache-dir",
+                    "openhop_core[hardware] @ "
+                    "git+https://github.com/openhop-dev/openhop_core.git"
+                    "@refs/pull/7/head",
+                ]
+            )
+        )
+        self.assertTrue(
+            branch_state.are_safe_pip_args(
+                [
+                    "install",
+                    "--upgrade",
+                    "--force-reinstall",
+                    "--no-cache-dir",
+                    "openhop_core[hardware] @ "
+                    "git+https://github.com/openhop-dev/openhop_core.git@dev",
                 ]
             )
         )

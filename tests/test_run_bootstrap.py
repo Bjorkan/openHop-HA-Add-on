@@ -87,9 +87,13 @@ def base_bootstrap_env(
     base_image_id.write_text("test-base\n", encoding="utf-8")
     options_file = root / "options.json"
     if not options_file.exists():
-        options_file.write_text(json.dumps({"branch_or_pr": "main"}), encoding="utf-8")
+        options_file.write_text(
+            json.dumps({"branch_or_pr": "main", "core_branch_or_pr": ""}),
+            encoding="utf-8",
+        )
     env = os.environ.copy()
     env.pop("OPENHOP_ADDON_SOURCE_REF", None)
+    env.pop("OPENHOP_ADDON_CORE_REF", None)
     env.update(
         {
             "OPENHOP_TEST_ROOT": str(root),
@@ -109,7 +113,7 @@ def base_bootstrap_env(
             "OPENHOP_ADDON_BASE_SITE_PACKAGES_GLOB": str(yaml_site_packages),
             "OPENHOP_ADDON_BASE_RUNTIME_DIR": str(base_runtime),
             "OPENHOP_ADDON_BASE_IMAGE_ID_FILE": str(base_image_id),
-            "OPENHOP_ADDON_BUILD_VERSION": "3.1.0",
+            "OPENHOP_ADDON_BUILD_VERSION": "3.2.0",
             "OPENHOP_ADDON_OPTIONS_FILE": str(options_file),
             "OPENHOP_ADDON_YQ": str(root / "missing-yq"),
         }
@@ -117,9 +121,12 @@ def base_bootstrap_env(
     return env
 
 
-def write_options(root: Path, value: object) -> Path:
+def write_options(root: Path, value: object, core_value: object = "") -> Path:
     options_file = root / "options.json"
-    options_file.write_text(json.dumps({"branch_or_pr": value}), encoding="utf-8")
+    options_file.write_text(
+        json.dumps({"branch_or_pr": value, "core_branch_or_pr": core_value}),
+        encoding="utf-8",
+    )
     return options_file
 
 
@@ -562,6 +569,259 @@ class BootstrapIntegrationTests(unittest.TestCase):
             self.assertIn("invalid 'branch_or_pr' app option", combined)
             self.assertFalse((root / "child-pid").exists())
 
+    def test_invalid_core_option_value_stops_before_start(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="openhop-addon-invalid-core-"
+        ) as temp_dir:
+            root = Path(temp_dir)
+            for directory in ("config", "data", "etc", "var", "opt"):
+                (root / directory).mkdir()
+            (root / "config" / "config.yaml").write_text(
+                "repeater:\n  node_name: invalid-core-test\nradio_type: null\n",
+                encoding="utf-8",
+            )
+            write_options(root, "dev", "bogus core!!")
+            base_runtime = create_packaged_runtime(root)
+            fake_pip = root / "fake-pip"
+            fake_pip.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            fake_pip.chmod(0o755)
+
+            env = base_bootstrap_env(root, base_runtime, fake_pip)
+            result = subprocess.run(
+                [str(RUN_SCRIPT)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            combined = result.stdout + result.stderr
+            self.assertIn("invalid 'core_branch_or_pr' app option", combined)
+            self.assertFalse((root / "child-pid").exists())
+
+    def test_core_override_is_installed_after_repeater(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="openhop-addon-core-") as temp_dir:
+            root = Path(temp_dir)
+            for directory in ("config", "data", "etc", "var", "opt"):
+                (root / directory).mkdir()
+            (root / "config" / "config.yaml").write_text(
+                "repeater:\n  node_name: core-test\nradio_type: null\n",
+                encoding="utf-8",
+            )
+            write_options(root, "dev", 7)
+            base_runtime = create_packaged_runtime(root)
+
+            fake_pip = root / "fake-pip"
+            fake_pip.write_text(
+                textwrap.dedent(
+                    r"""
+                    #!/usr/bin/python3
+                    import json
+                    import os
+                    import pathlib
+                    import sys
+
+                    root = pathlib.Path(os.environ["OPENHOP_TEST_ROOT"])
+                    calls_file = root / "pip-calls.jsonl"
+                    with calls_file.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(sys.argv[1:]) + "\n")
+                    site = next(
+                        (root / "data" / "venv" / "lib").glob(
+                            "python*/site-packages"
+                        )
+                    )
+                    spec = sys.argv[-1]
+                    if spec.startswith("openhop_repeater"):
+                        revision = spec.rsplit("@", 1)[-1]
+                        url = (
+                            "https://github.com/openhop-dev/"
+                            "openhop_repeater.git"
+                        )
+                        package = site / "repeater"
+                        package.mkdir(parents=True, exist_ok=True)
+                        (package / "__init__.py").write_text(
+                            "__version__ = 'dev-test'\n", encoding="utf-8"
+                        )
+                        (package / "main.py").write_text(
+                            "import os, pathlib, time\n"
+                            "def main():\n"
+                            "    root = pathlib.Path("
+                            "os.environ['OPENHOP_TEST_ROOT'])\n"
+                            "    (root / 'child-pid').write_text("
+                            "str(os.getpid()), encoding='utf-8')\n"
+                            "    (root / 'core-active').write_text("
+                            "'yes', encoding='utf-8')\n"
+                            "    while True: time.sleep(1)\n"
+                            "if __name__ == '__main__': main()\n",
+                            encoding="utf-8",
+                        )
+                        dist_name = "openhop_repeater-1.0.0.dist-info"
+                    else:
+                        revision = spec.rsplit("@", 1)[-1]
+                        url = (
+                            "https://github.com/openhop-dev/"
+                            "openhop_core.git"
+                        )
+                        dist_name = "openhop_core-1.0.0.dist-info"
+                    dist_info = site / dist_name
+                    dist_info.mkdir(parents=True, exist_ok=True)
+                    (dist_info / "METADATA").write_text(
+                        "Metadata-Version: 2.1\n", encoding="utf-8"
+                    )
+                    (dist_info / "direct_url.json").write_text(
+                        json.dumps(
+                            {
+                                "url": url,
+                                "vcs_info": {
+                                    "vcs": "git",
+                                    "requested_revision": revision,
+                                    "commit_id": "deadbeef",
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            fake_pip.chmod(0o755)
+
+            output = run_bootstrap_until_marker(
+                self,
+                root,
+                base_bootstrap_env(root, base_runtime, fake_pip),
+                "core-active",
+            )
+
+            calls = [
+                json.loads(line)
+                for line in (root / "pip-calls.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(calls[0][-1].endswith("@dev"))
+            self.assertIn("openhop_repeater", calls[0][-1])
+            self.assertEqual(
+                calls[1][-1],
+                "openhop_core[hardware] @ "
+                "git+https://github.com/openhop-dev/openhop_core.git"
+                "@refs/pull/7/head",
+            )
+            self.assertEqual(
+                (root / "data" / "venv" / ".openhop-ha-core").read_text(
+                    encoding="utf-8"
+                ),
+                "refs/pull/7/head\n",
+            )
+            self.assertIn(
+                "installed and verified openhop_core source 'refs/pull/7/head'",
+                output,
+            )
+            self.assertIn(
+                "selected core: refs/pull/7/head; active core: refs/pull/7/head",
+                output,
+            )
+
+    def test_clearing_core_override_clears_marker(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="openhop-addon-core-clear-"
+        ) as temp_dir:
+            root = Path(temp_dir)
+            for directory in ("config", "data", "etc", "var", "opt"):
+                (root / directory).mkdir()
+            (root / "config" / "config.yaml").write_text(
+                "repeater:\n  node_name: core-clear-test\nradio_type: null\n",
+                encoding="utf-8",
+            )
+            write_options(root, "main", "")
+            (root / "data" / "venv" / "bin").mkdir(parents=True)
+            (root / "data" / "venv" / ".openhop-ha-core").write_text(
+                "refs/pull/7/head\n", encoding="utf-8"
+            )
+            base_runtime = create_packaged_runtime(root)
+
+            fake_pip = root / "fake-pip"
+            fake_pip.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            fake_pip.chmod(0o755)
+
+            output = run_bootstrap_until_marker(
+                self,
+                root,
+                base_bootstrap_env(root, base_runtime, fake_pip),
+                "packaged-active",
+            )
+
+            self.assertFalse((root / "data" / "venv" / ".openhop-ha-core").exists())
+            self.assertIn("active core: pinned by repeater install", output)
+
+    def test_failed_core_install_stops_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="openhop-addon-core-fail-") as temp_dir:
+            root = Path(temp_dir)
+            for directory in ("config", "data", "etc", "var", "opt"):
+                (root / directory).mkdir()
+            (root / "config" / "config.yaml").write_text(
+                "repeater:\n  node_name: core-fail-test\nradio_type: null\n",
+                encoding="utf-8",
+            )
+            write_options(root, "main", "dev")
+            base_runtime = create_packaged_runtime(root)
+
+            fake_pip = root / "fake-pip"
+            fake_pip.write_text(
+                textwrap.dedent(
+                    r"""
+                    #!/usr/bin/python3
+                    import json
+                    import os
+                    import pathlib
+                    import sys
+
+                    root = pathlib.Path(os.environ["OPENHOP_TEST_ROOT"])
+                    spec = sys.argv[-1]
+                    if spec.startswith("openhop_core"):
+                        raise SystemExit(1)
+                    site = next(
+                        (root / "data" / "venv" / "lib").glob(
+                            "python*/site-packages"
+                        )
+                    )
+                    package = site / "repeater"
+                    package.mkdir(parents=True, exist_ok=True)
+                    (package / "__init__.py").write_text(
+                        "__version__ = 'dev-test'\n", encoding="utf-8"
+                    )
+                    (package / "main.py").write_text(
+                        "import time\ndef main():\n    while True: time.sleep(1)\n",
+                        encoding="utf-8",
+                    )
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            fake_pip.chmod(0o755)
+
+            env = base_bootstrap_env(root, base_runtime, fake_pip)
+            result = subprocess.run(
+                [str(RUN_SCRIPT)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            combined = result.stdout + result.stderr
+            self.assertIn(
+                "could not install requested openhop_core source 'dev'", combined
+            )
+            self.assertIn("refusing to start with other code", combined)
+            self.assertFalse((root / "child-pid").exists())
+
     def test_clean_exit_restarts_into_persisted_branch(self) -> None:
         with tempfile.TemporaryDirectory(prefix="openhop-addon-bootstrap-") as temp_dir:
             root = Path(temp_dir)
@@ -700,10 +960,12 @@ class BootstrapIntegrationTests(unittest.TestCase):
             fake_pip.chmod(0o755)
 
             (root / "options.json").write_text(
-                json.dumps({"branch_or_pr": "dev"}), encoding="utf-8"
+                json.dumps({"branch_or_pr": "dev", "core_branch_or_pr": ""}),
+                encoding="utf-8",
             )
             env = os.environ.copy()
             env.pop("OPENHOP_ADDON_SOURCE_REF", None)
+            env.pop("OPENHOP_ADDON_CORE_REF", None)
             env.update(
                 {
                     "OPENHOP_TEST_ROOT": str(root),
@@ -726,7 +988,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
                     "OPENHOP_ADDON_SYSTEM_PYTHON": "/usr/bin/python3",
                     "OPENHOP_ADDON_BASE_SITE_PACKAGES_GLOB": str(base_site),
                     "OPENHOP_ADDON_DEFAULT_BRANCH": "main",
-                    "OPENHOP_ADDON_BUILD_VERSION": "3.1.0",
+                    "OPENHOP_ADDON_BUILD_VERSION": "3.2.0",
                     "OPENHOP_ADDON_BASE_IMAGE_ID_FILE": str(base_image_id),
                     "OPENHOP_ADDON_OPTIONS_FILE": str(root / "options.json"),
                     "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER": (
@@ -786,7 +1048,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
             self.assertTrue(
                 (stale_venv / ".openhop-ha-python")
                 .read_text(encoding="utf-8")
-                .startswith("addon=3.1.0;base=packaged-code-v2;python=")
+                .startswith("addon=3.2.0;base=packaged-code-v2;python=")
             )
             self.assertEqual(
                 (stale_venv / ".openhop-ha-branch").read_text(encoding="utf-8"),
@@ -940,6 +1202,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
             )
             env = os.environ.copy()
             env.pop("OPENHOP_ADDON_SOURCE_REF", None)
+            env.pop("OPENHOP_ADDON_CORE_REF", None)
             env.update(
                 {
                     "OPENHOP_TEST_ROOT": str(root),
@@ -963,7 +1226,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
                     "OPENHOP_ADDON_BASE_SITE_PACKAGES_GLOB": str(yaml_site_packages),
                     "OPENHOP_ADDON_BASE_RUNTIME_DIR": str(base_runtime),
                     "OPENHOP_ADDON_BASE_IMAGE_ID_FILE": str(base_image_id),
-                    "OPENHOP_ADDON_BUILD_VERSION": "3.1.0",
+                    "OPENHOP_ADDON_BUILD_VERSION": "3.2.0",
                     "OPENHOP_ADDON_YQ": str(fake_yq),
                     "OPENHOP_ADDON_OPTIONS_FILE": str(root / "options.json"),
                 }
@@ -1146,6 +1409,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
             )
             env = os.environ.copy()
             env.pop("OPENHOP_ADDON_SOURCE_REF", None)
+            env.pop("OPENHOP_ADDON_CORE_REF", None)
             env.update(
                 {
                     "OPENHOP_TEST_ROOT": str(root),
@@ -1169,7 +1433,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
                     "OPENHOP_ADDON_BASE_SITE_PACKAGES_GLOB": str(yaml_site_packages),
                     "OPENHOP_ADDON_BASE_RUNTIME_DIR": str(base_runtime),
                     "OPENHOP_ADDON_BASE_IMAGE_ID_FILE": str(base_image_id),
-                    "OPENHOP_ADDON_BUILD_VERSION": "3.1.0",
+                    "OPENHOP_ADDON_BUILD_VERSION": "3.2.0",
                     "OPENHOP_ADDON_YQ": str(fake_yq),
                     "OPENHOP_ADDON_OPTIONS_FILE": str(root / "options.json"),
                 }
@@ -1234,6 +1498,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
             )
             env = os.environ.copy()
             env.pop("OPENHOP_ADDON_SOURCE_REF", None)
+            env.pop("OPENHOP_ADDON_CORE_REF", None)
             env.update(
                 {
                     "OPENHOP_ADDON_CONFIG_DIR": str(root / "config"),
@@ -1253,7 +1518,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
                     "OPENHOP_ADDON_VENV_PIP_WRAPPER": str(PIP_WRAPPER),
                     "OPENHOP_ADDON_TEST_WITHOUT_PIP": "true",
                     "OPENHOP_ADDON_SYSTEM_PYTHON": "/usr/bin/python3",
-                    "OPENHOP_ADDON_BUILD_VERSION": "3.1.0",
+                    "OPENHOP_ADDON_BUILD_VERSION": "3.2.0",
                 }
             )
 

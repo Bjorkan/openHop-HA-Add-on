@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.2.0
+
+### Core branch / PR override
+
+- Add an optional `core_branch_or_pr` app option selecting an
+  `openhop-dev/openhop_core` branch or pull request (for example `main` or
+  `7`). It is installed on top of the repeater install on boot; leave it
+  empty to use the core pinned by the repeater.
+- Invalid core values and failed core installs stop the app instead of
+  falling back to other code.
+
 ## 3.1.0
 
 ### Branch / PR selection from the app Configuration tab

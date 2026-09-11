@@ -41,9 +41,9 @@ start before radio hardware has been configured.
 
 ## Configuration
 
-`/config/config.yaml` is the only source of repeater settings. The single
-Home Assistant app option, `branch_or_pr`, selects which upstream code runs
-and is unrelated to the repeater configuration itself.
+`/config/config.yaml` is the only source of repeater settings. The Home
+Assistant app options, `branch_or_pr` and `core_branch_or_pr`, select which
+upstream code runs and are unrelated to the repeater configuration itself.
 
 Review at least the following values before normal operation:
 
@@ -73,6 +73,19 @@ The requested source is installed on boot from
 a branch/PR that cannot be installed and verified, stops the app instead of
 starting other code. The web-interface release-channel selector is ignored.
 
+An optional second option selects an `openhop-dev/openhop_core` branch or
+pull request to test alongside the repeater:
+
+- `core_branch_or_pr: ""` (empty) uses the core pinned by the repeater.
+- `core_branch_or_pr: main` forces the `main` branch of core.
+- `core_branch_or_pr: 7` runs pull request `7` from `openhop-dev/openhop_core`
+  (installed as `refs/pull/7/head`).
+
+The core override is installed after the repeater on boot, so it wins over
+the repeater's own pinned core dependency. An invalid core value, or a
+core ref that cannot be installed and verified, stops the app instead of
+starting other code.
+
 The installed source is stored in a persistent Python environment:
 
 ```text
@@ -91,6 +104,7 @@ stored in a small marker file so startup still works if upstream metadata
 cleanup removes a `direct_url.json` file.
 
 To return to the default branch, set `branch_or_pr` back to `main` and
+restart the app. To stop overriding core, clear `core_branch_or_pr` and
 restart the app.
 
 ## Persistent storage
@@ -100,7 +114,8 @@ restart the app.
 | `/config/config.yaml` | User-editable openHop Repeater configuration |
 | `/data/venv` | Python environment containing the installed branch/PR |
 | `/data/venv/.openhop-ha-python` | App-image and Python compatibility marker for the environment |
-| `/data/venv/.openhop-ha-branch` | Last source whose venv installation was verified by the app |
+| `/data/venv/.openhop-ha-branch` | Last repeater source whose venv installation was verified |
+| `/data/venv/.openhop-ha-core` | Last core override whose venv installation was verified |
 | `/var/lib/openhop_repeater` | Internal link to `/data` used by openHop Repeater |
 | `/opt/openhop_repeater/venv` | Internal link to `/data/venv` used by the updater |
 
@@ -113,7 +128,7 @@ the app is uninstalled.
 The generated virtual environment is excluded from app backups because it is
 specific to the app image, packaged Python runtime and dependencies, system
 architecture, and Python version. It is rebuilt from the configured
-`branch_or_pr` app option when required.
+`branch_or_pr` and `core_branch_or_pr` app options when required.
 
 The app image also contains a protected copy of its packaged `main` runtime
 outside `/opt/openhop_repeater`, because the upstream updater removes source
@@ -163,7 +178,8 @@ use BCM GPIO numbering in `config.yaml`.
 There are two independent update paths:
 
 - **openHop Repeater code** is selected with the `branch_or_pr` app option
-  and installed on boot.
+  and installed on boot. An optional `core_branch_or_pr` app option
+  overrides `openhop_core` on top of that install.
 - **Home Assistant app updates** are installed from Home Assistant and update
   the container image, startup scripts, bundled default version, and packaged
   configuration template. Missing template settings are merged into the user
@@ -188,6 +204,7 @@ Check the app log for entries similar to:
 
 ```text
 selected source: ...; active source: ...
+selected core: ...; active core: ...
 runtime package: ...
 ```
 
