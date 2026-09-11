@@ -3,10 +3,10 @@
 Run openHop Repeater as a Home Assistant app with:
 
 - a complete YAML configuration file;
-- branch selection from the repeater web interface;
-- persistent branch and runtime data;
-- verification that the selected branch is the package Python actually imports;
-- automatic recovery to a protected packaged runtime when an update fails;
+- branch or pull-request selection from the app Configuration tab;
+- persistent source and runtime data;
+- verification that the requested source is the package Python actually imports;
+- refusal to start when the requested source cannot be installed and verified;
 - support for SPI/GPIO radios, USB devices, serial KISS modems, TCP modems, and
   companion services.
 

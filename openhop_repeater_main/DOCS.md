@@ -41,8 +41,9 @@ start before radio hardware has been configured.
 
 ## Configuration
 
-`/config/config.yaml` is the only source of repeater settings. Home Assistant
-app options are not used for the openHop Repeater configuration.
+`/config/config.yaml` is the only source of repeater settings. The single
+Home Assistant app option, `branch_or_pr`, selects which upstream code runs
+and is unrelated to the repeater configuration itself.
 
 Review at least the following values before normal operation:
 
@@ -57,71 +58,62 @@ Review at least the following values before normal operation:
 The bundled template contains the configuration sections and comments supplied
 with the openHop Repeater version included in the app image.
 
-## Selecting an openHop Repeater branch
+## Selecting an openHop Repeater branch or pull request
 
-Branches are managed from the repeater web interface:
+This app image is for testing upstream changes. The branch or pull request
+to run is selected on the Home Assistant app **Configuration** tab:
 
-1. Open the web interface.
-2. Open the update dialog.
-3. Select the required **Release Channel**.
-4. Apply the selection.
-5. Choose **Install Update**.
+- `branch_or_pr: main` runs the default branch.
+- `branch_or_pr: dev` runs the `dev` branch.
+- `branch_or_pr: 42` runs pull request `42` from
+  `openhop-dev/openhop_repeater` (installed as `refs/pull/42/head`).
 
-The release channel may contain a branch name such as `main` or `dev`. Branch
-names are validated before installation.
+The requested source is installed on boot from
+`https://github.com/openhop-dev/openhop_repeater.git`. An invalid value, or
+a branch/PR that cannot be installed and verified, stops the app instead of
+starting other code. The web-interface release-channel selector is ignored.
 
-The selected branch is stored in:
-
-```text
-/data/.update_channel
-```
-
-The installed branch is stored in a persistent Python environment:
+The installed source is stored in a persistent Python environment:
 
 ```text
 /data/venv
 ```
 
-Both paths are part of the app's private Home Assistant data directory. The
-selected channel survives service restarts, container recreation, and app
-upgrades. The generated environment is retained only while it remains
-compatible with the current app image and Python runtime.
+The path is part of the app's private Home Assistant data directory. The
+generated environment is retained only while it remains compatible with the
+current app image and Python runtime, and it is reinstalled whenever the
+configured branch/PR changes.
 
-After an in-app update, openHop Repeater exits so the selected code can be
-loaded. The app starts the service again inside the same container and uses
-the persistent environment on the next launch.
+At startup, the app checks both installation metadata and the actual Python
+import path. A source is considered active only when the requested ref
+matches the verified installation in `/data/venv`. The verified ref is also
+stored in a small marker file so startup still works if upstream metadata
+cleanup removes a `direct_url.json` file.
 
-At startup, the app checks both branch metadata and the actual Python import
-path. A branch is considered active only when the selected branch matches the
-verified installation in `/data/venv`. The verified branch is also stored in a
-small marker file so startup still works if upstream metadata cleanup removes a
-`direct_url.json` file. If an installation fails or leaves the environment
-unusable, the app discards that environment and reconstructs a clean one
-that runs the protected version packaged in the app image. The selected channel
-is retained so installation can be retried after the next restart.
-
-To return to the default branch, select `main` in **Release Channel** and run
-**Install Update**.
+To return to the default branch, set `branch_or_pr` back to `main` and
+restart the app.
 
 ## Persistent storage
 
 | Path | Contents |
 |---|---|
 | `/config/config.yaml` | User-editable openHop Repeater configuration |
-| `/data/.update_channel` | Selected openHop Repeater branch |
-| `/data/venv` | Python environment containing the installed branch |
+| `/data/venv` | Python environment containing the installed branch/PR |
 | `/data/venv/.openhop-ha-python` | App-image and Python compatibility marker for the environment |
-| `/data/venv/.openhop-ha-branch` | Last branch whose venv installation was verified by the app |
+| `/data/venv/.openhop-ha-branch` | Last source whose venv installation was verified by the app |
 | `/var/lib/openhop_repeater` | Internal link to `/data` used by openHop Repeater |
 | `/opt/openhop_repeater/venv` | Internal link to `/data/venv` used by the updater |
+
+A legacy `/data/.update_channel` file left behind by older app versions is
+ignored.
 
 The `/data` directory is private to the app. Home Assistant removes it when
 the app is uninstalled.
 
 The generated virtual environment is excluded from app backups because it is
 specific to the app image, packaged Python runtime and dependencies, system
-architecture, and Python version. It is rebuilt from the stored release channel
-when required.
+architecture, and Python version. It is rebuilt from the configured
+`branch_or_pr` app option when required.
 
 The app image also contains a protected copy of its packaged `main` runtime
 outside `/opt/openhop_repeater`, because the upstream updater removes source
@@ -170,15 +162,14 @@ use BCM GPIO numbering in `config.yaml`.
 
 There are two independent update paths:
 
-- **openHop Repeater updates** are installed from the repeater web interface and
-  control the selected upstream branch.
+- **openHop Repeater code** is selected with the `branch_or_pr` app option
+  and installed on boot.
 - **Home Assistant app updates** are installed from Home Assistant and update
   the container image, startup scripts, bundled default version, and packaged
   configuration template. Missing template settings are merged into the user
   configuration on the next start.
 
-Installing an openHop Repeater branch does not update the Home Assistant app
-itself.
+Changing the repeater code does not update the Home Assistant app itself.
 
 ## Backups
 
@@ -191,32 +182,29 @@ app backup.
 
 ## Troubleshooting
 
-### The selected branch is not active
+### The selected branch/PR is not active
 
 Check the app log for entries similar to:
 
 ```text
-selected branch: ...; active branch: ...
+selected source: ...; active source: ...
 runtime package: ...
 ```
 
-A branch installed by the updater should load from `/data/venv`. The protected
-default package included in the image is used when no separate branch
-installation is active. Startup logs report the resolved package path rather
-than trusting installation metadata alone.
+The installed source should load from `/data/venv`. Startup logs report the
+resolved package path rather than trusting installation metadata alone.
 
-### A branch cannot be installed
+### A branch/PR cannot be installed
 
-Branch installation requires:
+Source installation requires:
 
 - working DNS;
 - HTTPS access to GitHub;
-- a valid branch name;
-- a branch that can be installed by `pip` for the current architecture.
+- a valid branch name or an existing pull-request number;
+- a ref that can be installed by `pip` for the current architecture.
 
-The app removes a failed or partially modified branch environment and falls
-back to the protected runtime included in the app image. Review the complete
-installation error in the app log before retrying.
+A failed installation stops the app instead of starting other code. Review
+the complete installation error in the app log before retrying.
 
 ### The app does not start after editing `config.yaml`
 

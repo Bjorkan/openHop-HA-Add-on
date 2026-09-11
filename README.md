@@ -5,8 +5,9 @@ This repository provides a Home Assistant app for
 
 The app runs the repeater as a managed Home Assistant service while keeping
 all repeater settings in a single YAML file. Missing packaged defaults are
-merged without replacing user values. Branches can be selected and installed
-from the openHop Repeater web interface.
+merged without replacing user values. The upstream branch or pull request to
+run is selected with the `branch_or_pr` app option on the Configuration tab
+and installed on boot.
 
 ## Installation
 
@@ -34,17 +35,20 @@ Inside the app, the same file is available as:
 /config/config.yaml
 ```
 
-Home Assistant app options are not used for repeater settings. The YAML file
-is the only configuration source.
+Home Assistant app options select which upstream code runs (`branch_or_pr`,
+for example `main` or `42`). The YAML file is the only source of repeater
+settings.
 
-## Branch selection
+## Branch / PR selection
 
-Open the update dialog in the repeater web interface to select and install an
-openHop Repeater branch. The selected branch, verified branch marker, and
-Python environment are stored in the app's persistent `/data` directory.
-The selected channel survives restarts and app upgrades; the generated
-environment is rebuilt whenever its app-image compatibility changes. Startup
-verifies the real import path before reporting a branch as active.
+Set `branch_or_pr` on the app Configuration tab to a branch name such as
+`main` or to a pull-request number such as `42` from
+`openhop-dev/openhop_repeater`. The requested source is installed on boot;
+invalid values and failed installs stop the app. The verified source marker
+and Python environment are stored in the app's persistent `/data` directory.
+The generated environment is rebuilt whenever its app-image compatibility
+changes. Startup verifies the real import path before reporting a source as
+active.
 
 See [DOCS.md](./openhop_repeater_main/DOCS.md) for complete installation,
 configuration, hardware, update, storage, and troubleshooting instructions.
@@ -53,7 +57,7 @@ configuration, hardware, update, storage, and troubleshooting instructions.
 
 ```text
 openhop_repeater_main/
-├── config.yaml          # Home Assistant app metadata
+├── config.yaml          # Home Assistant app metadata + branch_or_pr option
 ├── config.yaml.example  # openHop Repeater configuration template
 ├── Dockerfile
 ├── DOCS.md

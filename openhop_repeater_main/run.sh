@@ -78,10 +78,11 @@ unset OPENHOP_ADDON_STOP_REQUESTED
 unset SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER
 
 CONFIG_FILE="${ADDON_CONFIG_DIR}/config.yaml"
-CHANNEL_FILE="${DATA_DIR}/.update_channel"
 VENV_DIR="${DATA_DIR}/venv"
 PYTHON_MARKER="${VENV_DIR}/.openhop-ha-python"
 BRANCH_MARKER="${VENV_DIR}/.openhop-ha-branch"
+OPTIONS_FILE="${OPENHOP_ADDON_OPTIONS_FILE:-/data/options.json}"
+LEGACY_CHANNEL_FILE="${DATA_DIR}/.update_channel"
 
 mkdir -p "${ADDON_CONFIG_DIR}" "${DATA_DIR}"
 
@@ -428,8 +429,9 @@ create_clean_venv() {
         fatal "could not persist update-environment compatibility marker"
     fi
 
-    # The in-app updater installs to /opt/openhop_repeater/venv. Point that
-    # path at /data/venv so updates survive app upgrades and container restarts.
+    # The upstream updater hard-codes /opt/openhop_repeater/venv as its install
+    # target. Point that path at /data/venv so installs survive app upgrades
+    # and container restarts.
     replace_directory_with_symlink "${UPDATE_VENV_LINK}" "${VENV_DIR}" false
     configure_venv_runtime
 }
@@ -455,14 +457,28 @@ else
     configure_venv_runtime
 fi
 
-if [ ! -f "${CHANNEL_FILE}" ]; then
-    printf '%s\n' "${DEFAULT_BRANCH}" > "${CHANNEL_FILE}"
+# The app Configuration tab is the only supported way to select which
+# upstream code runs. The legacy in-app channel file and the web-interface
+# release-channel selector are no longer honored: a stale channel value must
+# never override the configured option.
+if [ -n "${OPENHOP_ADDON_SOURCE_REF:-}" ]; then
+    SELECTED_REF="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" normalize "${OPENHOP_ADDON_SOURCE_REF}")" \
+        || fatal "invalid OPENHOP_ADDON_SOURCE_REF value '${OPENHOP_ADDON_SOURCE_REF}': use a branch name (for example 'main') or a pull-request number (for example '42')"
+elif [ ! -f "${OPTIONS_FILE}" ]; then
+    SELECTED_REF="${DEFAULT_BRANCH}"
+else
+    SELECTED_REF="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" desired-ref --strict --options "${OPTIONS_FILE}")" \
+        || fatal "invalid 'branch_or_pr' app option in ${OPTIONS_FILE}: use a branch name (for example 'main') or a pull-request number (for example '42')"
 fi
-SELECTED_BRANCH="$(head -n 1 "${CHANNEL_FILE}" 2>/dev/null | tr -d '\r\n' || true)"
-if ! "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" validate "${SELECTED_BRANCH}"; then
-    warn "invalid persisted branch '${SELECTED_BRANCH}'; resetting to '${DEFAULT_BRANCH}'"
-    SELECTED_BRANCH="${DEFAULT_BRANCH}"
-    printf '%s\n' "${SELECTED_BRANCH}" > "${CHANNEL_FILE}"
+if ! "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" validate-source "${SELECTED_REF}"; then
+    fatal "invalid requested source ref '${SELECTED_REF}'"
+fi
+SELECTED_BRANCH="${SELECTED_REF}"
+if [ -f "${LEGACY_CHANNEL_FILE}" ]; then
+    LEGACY_BRANCH="$(head -n 1 "${LEGACY_CHANNEL_FILE}" 2>/dev/null | tr -d '\r\n' || true)"
+    if [ -n "${LEGACY_BRANCH}" ] && [ "${LEGACY_BRANCH}" != "${SELECTED_REF}" ]; then
+        warn "ignoring legacy branch selection '${LEGACY_BRANCH}' from ${LEGACY_CHANNEL_FILE}; the app Configuration tab is the only branch/PR source"
+    fi
 fi
 
 detected_installed_branch() {
@@ -473,7 +489,7 @@ read_branch_marker() {
     marker_branch=""
     if [ -r "${BRANCH_MARKER}" ]; then
         marker_branch="$(head -n 1 "${BRANCH_MARKER}" 2>/dev/null | tr -d '\r\n' || true)"
-        if ! "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" validate "${marker_branch}"; then
+        if ! "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" validate-source "${marker_branch}"; then
             warn "discarding invalid installed-branch marker '${marker_branch}'"
             marker_branch=""
             rm -f "${BRANCH_MARKER}"
@@ -512,21 +528,33 @@ reset_to_packaged_runtime() {
     fi
 }
 
+fail_source_install() {
+    ref="$1"
+    detail="$2"
+    fatal "could not install requested source '${ref}' from ${UPSTREAM_GIT_URL} (${detail}); refusing to start with other code"
+}
+
 # Read installation metadata before importing repeater.main. Importing the web
 # package runs upstream dist-info cleanup, which may remove direct_url.json when
-# a packaged distribution and a newly installed branch report competing
-# versions. Capturing the ref first lets the app verify and persist a successful
-# first in-app branch update instead of needlessly reinstalling it.
+# a packaged distribution and a newly installed source report competing
+# versions. Capturing the ref first lets the app verify and persist a
+# successful install instead of needlessly reinstalling it.
 DETECTED_BRANCH="$(detected_installed_branch)"
 MARKED_BRANCH="$(read_branch_marker)"
 
-# A failed or interrupted in-app pip operation can leave the persistent venv in
-# a partially uninstalled state. Recover deterministically rather than trusting
+# A failed or interrupted pip operation can leave the persistent venv in a
+# partially uninstalled state. Recover deterministically rather than trusting
 # captured metadata from a package that cannot actually be imported.
+# Recovery is only safe while the venv has no verified requested ref yet; it
+# can never fall back to other code once a ref was requested.
 if ! can_import_repeater; then
-    reset_to_packaged_runtime "the persistent update environment is not runnable"
-    DETECTED_BRANCH=""
-    MARKED_BRANCH=""
+    if [ -z "${DETECTED_BRANCH}" ] && [ -z "${MARKED_BRANCH}" ]; then
+        reset_to_packaged_runtime "the persistent update environment is not runnable"
+        DETECTED_BRANCH=""
+        MARKED_BRANCH=""
+    else
+        fatal "the persistent update environment is not runnable; refusing to start with other code"
+    fi
 fi
 
 RUNTIME_FROM_VENV=false
@@ -534,8 +562,10 @@ if runtime_uses_venv; then
     RUNTIME_FROM_VENV=true
 fi
 
-# A successful update performed from the web interface writes direct_url.json.
-# Adopt it only after verifying that Python actually imports from the venv.
+# The web interface must not change which code runs: the app Configuration
+# tab is the only source. Metadata that matches the requested ref is adopted
+# after verifying that Python actually imports from the venv; anything else
+# is replaced by a fresh install of the requested ref below.
 if [ "${RUNTIME_FROM_VENV}" = "true" ] \
     && [ -n "${DETECTED_BRANCH}" ] \
     && [ "${DETECTED_BRANCH}" = "${SELECTED_BRANCH}" ]; then
@@ -565,7 +595,7 @@ elif [ "${INSTALLED_BRANCH}" != "${SELECTED_BRANCH}" ] \
 fi
 
 if [ "${NEEDS_BRANCH_INSTALL}" = "true" ]; then
-    log "activating branch '${SELECTED_BRANCH}' in the persistent update environment"
+    log "installing requested source '${SELECTED_BRANCH}' from ${UPSTREAM_GIT_URL}"
     INSTALL_SPEC="openhop_repeater[hardware] @ git+${UPSTREAM_GIT_URL}@${SELECTED_BRANCH}"
     INSTALL_VERIFIED=false
     if GIT_TERMINAL_PROMPT=0 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_DEFAULT_TIMEOUT=30 \
@@ -577,20 +607,16 @@ if [ "${NEEDS_BRANCH_INSTALL}" = "true" ]; then
             write_branch_marker "${SELECTED_BRANCH}"
             INSTALLED_BRANCH="${SELECTED_BRANCH}"
             INSTALL_VERIFIED=true
-            log "installed and verified branch '${SELECTED_BRANCH}'"
+            log "installed and verified source '${SELECTED_BRANCH}'"
         else
-            warn "branch '${SELECTED_BRANCH}' installation completed but runtime verification failed"
+            fail_source_install "${SELECTED_BRANCH}" "runtime verification failed"
         fi
     else
-        warn "could not install branch '${SELECTED_BRANCH}'"
+        fail_source_install "${SELECTED_BRANCH}" "pip install failed"
     fi
 
     if [ "${INSTALL_VERIFIED}" != "true" ]; then
-        reset_to_packaged_runtime "branch '${SELECTED_BRANCH}' could not be activated safely"
-        DETECTED_BRANCH=""
-        MARKED_BRANCH=""
-        INSTALLED_BRANCH=""
-        RUNTIME_FROM_VENV=false
+        fail_source_install "${SELECTED_BRANCH}" "installation could not be verified"
     fi
 fi
 
@@ -610,8 +636,12 @@ if runtime_uses_venv; then
 else
     ACTIVE_BRANCH="${DEFAULT_BRANCH} (packaged image)"
 fi
+if [ "${ACTIVE_BRANCH}" != "${SELECTED_BRANCH}" ] \
+    && [ "${ACTIVE_BRANCH}" != "${DEFAULT_BRANCH} (packaged image)" ]; then
+    fail_source_install "${SELECTED_BRANCH}" "active source '${ACTIVE_BRANCH}' does not match the requested source"
+fi
 ACTIVE_VERSION="$("${VENV_PYTHON}" -c 'import repeater; print(getattr(repeater, "__version__", "unknown"))')"
-log "selected branch: ${SELECTED_BRANCH}; active branch: ${ACTIVE_BRANCH}; version: ${ACTIVE_VERSION}"
+log "selected source: ${SELECTED_BRANCH}; active source: ${ACTIVE_BRANCH}; version: ${ACTIVE_VERSION}"
 log "runtime package: ${IMPORT_PATH}"
 
 replace_directory_with_symlink "${RUNTIME_CONFIG_DIR}" "${ADDON_CONFIG_DIR}" false
@@ -643,9 +673,10 @@ stop_child_and_wait() {
     wait "${stop_watchdog_pid}" 2>/dev/null || true
 }
 
-# The firmware deliberately exits its process after an in-app update or restart
-# request. Keep PID 1 alive long enough to rerun this bootstrap so the selected
-# branch becomes active without depending on an external container restart.
+# Restart requests come from the supervised repeater process itself (for
+# example configuration reloads). Keep PID 1 alive long enough to rerun this
+# bootstrap so the configured source stays active without depending on an
+# external container restart.
 if [ "${STOP_REQUESTED}" = "true" ]; then
     exit 0
 fi
@@ -683,7 +714,7 @@ if [ "${EXIT_CODE}" -eq 0 ]; then
         fatal "repeater exited cleanly too many times before reaching 30 seconds of stable runtime; refusing a restart loop"
     fi
     export OPENHOP_ADDON_RAPID_RESTARTS="${rapid_restarts}"
-    log "repeater requested a restart; rerunning branch bootstrap"
+    log "repeater requested a restart; rerunning source bootstrap"
     sleep 1 || true
     if [ "${STOP_REQUESTED}" = "true" ]; then
         exit 0

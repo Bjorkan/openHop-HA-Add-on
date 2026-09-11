@@ -1,6 +1,6 @@
 FROM openhop/openhop-repeater:main
 
-ARG BUILD_VERSION=3.0.0
+ARG BUILD_VERSION=3.1.0
 ARG BUILD_ARCH
 
 USER root

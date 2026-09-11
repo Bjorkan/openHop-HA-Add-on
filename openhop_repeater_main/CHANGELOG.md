@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.1.0
+
+### Branch / PR selection from the app Configuration tab
+
+- Select the upstream branch or pull request from the Home Assistant app
+  Configuration tab (`branch_or_pr`, for example `main` or `42`). The
+  requested source is installed on boot; invalid values and failed installs
+  stop the app instead of falling back to other code.
+- The Configuration tab is the only branch/PR source. Legacy in-app channel
+  selections from the repeater web interface are ignored.
+
 ## 3.0.0
 
 ### Home Assistant integration
@@ -26,19 +37,19 @@
 
 ### Branch updates and recovery
 
-- Support release-channel selection and branch installation from the openHop
-  Repeater web interface.
-- Persist the selected channel and verified branch metadata in `/data`.
+- Install the branch/PR requested by the `branch_or_pr` app option on boot.
+- Persist the verified source ref in `/data`.
 - Capture `direct_url.json` before upstream metadata cleanup runs, then verify
-  the actual imported package path before reporting a branch as active.
-- Guard the updater's venv `pip` entry point so it accepts only version checks
-  and branch installs targeting a validated Git ref in the official repository.
+  the actual imported package path before reporting a source as active.
+- Guard the venv `pip` entry point so it accepts only version checks
+  and installs targeting a validated branch or pull-request ref in the
+  official repository.
 - Preserve a protected copy of the packaged runtime and setup-wizard JSON files
   outside the source tree removed by the upstream updater.
-- Detect broken or partially modified update environments, rebuild them cleanly,
-  and fall back to the protected packaged runtime after failed branch updates.
-- Restart the repeater inside the same container after a successful in-app
-  update while preventing rapid clean exits from becoming an infinite loop.
+- Refuse to start when the requested source cannot be installed and verified
+  instead of falling back to other code.
+- Restart the repeater inside the same container after a clean restart request
+  while preventing rapid clean exits from becoming an infinite loop.
 
 ### Runtime lifecycle
 

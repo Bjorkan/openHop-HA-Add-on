@@ -69,10 +69,19 @@ def validate_app(app: Path) -> str:
         fail(f"{app.name}: slug must match directory name, got {slug!r}")
     if not SEMVER.fullmatch(str(metadata.get("version", ""))):
         fail(f"{app.name}: version must be semantic versioning")
-    if metadata.get("schema") is not False:
-        fail(f"{app.name}: schema must be false because config.yaml is the source of truth")
-    if "options" in metadata:
-        fail(f"{app.name}: Home Assistant options must not duplicate runtime config.yaml")
+    schema = metadata.get("schema")
+    if not isinstance(schema, dict) or schema != {"branch_or_pr": "str"}:
+        fail(
+            f"{app.name}: schema must declare exactly the branch_or_pr option, "
+            "got {!r}".format(schema)
+        )
+    options = metadata.get("options")
+    if not isinstance(options, dict) or options != {"branch_or_pr": "main"}:
+        fail(
+            f"{app.name}: options must default branch_or_pr to main, got {{!r}}".format(
+                options
+            )
+        )
     if metadata.get("init") is not True:
         fail(f"{app.name}: Home Assistant's default container init must remain enabled")
     if metadata.get("full_access") is True:
@@ -137,13 +146,18 @@ def validate_app(app: Path) -> str:
     for required_fragment in (
         "/data/venv",
         "/opt/openhop_repeater/venv",
-        ".update_channel",
-        "\"${VENV_PYTHON}\" -m repeater.main",
-        "repeater requested a restart; rerunning branch bootstrap",
+        "LEGACY_CHANNEL_FILE",
+        '"${VENV_PYTHON}" -m repeater.main',
+        "repeater requested a restart; rerunning source bootstrap",
         "unset SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER",
         "OPENHOP_ADDON_BUILD_VERSION",
         "OPENHOP_ADDON_BASE_IMAGE_ID_FILE",
         "OPENHOP_ADDON_BASE_RUNTIME_DIR",
+        "OPENHOP_ADDON_OPTIONS_FILE",
+        "OPENHOP_ADDON_SOURCE_REF",
+        "desired-ref --strict",
+        "validate-source",
+        "branch_or_pr",
         "RUNTIME_COMPATIBILITY",
         ".openhop-ha-branch",
         "runtime_uses_venv",
@@ -159,9 +173,12 @@ def validate_app(app: Path) -> str:
         "OPENHOP_ADDON_PATH_UTILS_HELPER",
         "OPENHOP_ADDON_CONFIG_HELPER",
         "OPENHOP_ADDON_RUNTIME_INFO_HELPER",
+        "refusing to start with other code",
     ):
         if required_fragment not in run_text:
-            fail(f"{app.name}/run.sh is missing branch runtime logic: {required_fragment}")
+            fail(
+                f"{app.name}/run.sh is missing branch runtime logic: {required_fragment}"
+            )
 
     dockerfile = (app / "Dockerfile").read_text(encoding="utf-8")
     expected_build_version = f"ARG BUILD_VERSION={metadata['version']}"
@@ -197,6 +214,32 @@ def validate_app(app: Path) -> str:
     ):
         if required_fragment not in dockerfile:
             fail(f"{app.name}/Dockerfile is missing: {required_fragment}")
+
+    helper_source = (lib_dir / "branch_state.py").read_text(encoding="utf-8")
+    for required_fragment in (
+        "normalize_source_ref",
+        "read_desired_ref",
+        "resolve_desired_ref",
+        "is_valid_source_ref",
+        "refs/pull/",
+        "branch_or_pr",
+        "desired-ref",
+        "validate-source",
+    ):
+        if required_fragment not in helper_source:
+            fail(
+                f"{app.name}/branch_state.py is missing branch/PR logic: {required_fragment}"
+            )
+
+    translations = load_yaml(app / "translations" / "en.yaml")
+    if not isinstance(translations, dict):
+        fail(f"{app.name}/translations/en.yaml must contain a mapping")
+    configuration = translations.get("configuration")
+    branch_label = (
+        configuration.get("branch_or_pr") if isinstance(configuration, dict) else None
+    )
+    if not isinstance(branch_label, dict) or not branch_label.get("name"):
+        fail(f"{app.name}/translations/en.yaml must name the branch_or_pr option")
 
     invalid_terms = ("app_config", "app_configs")
     text_files = [

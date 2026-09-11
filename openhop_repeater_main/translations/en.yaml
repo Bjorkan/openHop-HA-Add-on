@@ -1,0 +1,6 @@
+configuration:
+  branch_or_pr:
+    name: Branch or pull request
+    description: Upstream branch (for example "main") or pull-request number
+      (for example "42") from openhop-dev/openhop_repeater to run. Applied on
+      boot. Invalid values and failed installs stop the app.

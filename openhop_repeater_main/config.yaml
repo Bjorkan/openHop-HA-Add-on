@@ -1,5 +1,5 @@
 name: openHop Repeater
-version: "3.0.0"
+version: "3.1.0"
 slug: openhop_repeater_main
 description: Run and update openHop Repeater from Home Assistant
 url: "https://github.com/Bjorkan/openHop-HA-Add-on"
@@ -25,4 +25,7 @@ full_access: true
 backup: cold
 backup_exclude:
   - venv/**
-schema: false
+options:
+  branch_or_pr: main
+schema:
+  branch_or_pr: str
