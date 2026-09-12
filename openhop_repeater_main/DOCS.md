@@ -73,6 +73,17 @@ The requested source is installed on boot from
 a branch/PR that cannot be installed and verified, stops the app instead of
 starting other code. The web-interface release-channel selector is ignored.
 
+On every startup the app also verifies that the installed source is the
+newest version of the requested ref: it resolves the current upstream
+commit of the branch or pull request through the GitHub API and reinstalls
+the source before starting when new commits have been pushed. A pull
+request is therefore always tested at its current head. When the check
+cannot reach GitHub, startup continues with the previously verified
+installed source and logs a warning. The packaged default `main` runtime
+shipped in the app image has no upstream commit to compare; it is refreshed
+through Home Assistant app updates, while a `main` source installed into
+`/data/venv` is version-checked like any other ref.
+
 An optional second option selects an `openhop-dev/openhop_core` branch or
 pull request to test alongside the repeater:
 
@@ -84,7 +95,8 @@ pull request to test alongside the repeater:
 The core override is installed after the repeater on boot, so it wins over
 the repeater's own pinned core dependency. An invalid core value, or a
 core ref that cannot be installed and verified, stops the app instead of
-starting other code.
+starting other code. The core override is version-checked on every startup
+in the same way as the repeater source.
 
 The installed source is stored in a persistent Python environment:
 
@@ -109,15 +121,17 @@ restart the app.
 
 ## Persistent storage
 
-| Path | Contents |
-|---|---|
-| `/config/config.yaml` | User-editable openHop Repeater configuration |
-| `/data/venv` | Python environment containing the installed branch/PR |
-| `/data/venv/.openhop-ha-python` | App-image and Python compatibility marker for the environment |
-| `/data/venv/.openhop-ha-branch` | Last repeater source whose venv installation was verified |
-| `/data/venv/.openhop-ha-core` | Last core override whose venv installation was verified |
-| `/var/lib/openhop_repeater` | Internal link to `/data` used by openHop Repeater |
-| `/opt/openhop_repeater/venv` | Internal link to `/data/venv` used by the updater |
+| Path                                   | Contents                                                                   |
+| -------------------------------------- | -------------------------------------------------------------------------- |
+| `/config/config.yaml`                  | User-editable openHop Repeater configuration                               |
+| `/data/venv`                           | Python environment containing the installed branch/PR                      |
+| `/data/venv/.openhop-ha-python`        | App-image and Python compatibility marker for the environment              |
+| `/data/venv/.openhop-ha-branch`        | Last repeater source whose venv installation was verified                  |
+| `/data/venv/.openhop-ha-core`          | Last core override whose venv installation was verified                    |
+| `/data/venv/.openhop-ha-source-commit` | Upstream commit of the verified repeater source, compared on every startup |
+| `/data/venv/.openhop-ha-core-commit`   | Upstream commit of the verified core override, compared on every startup   |
+| `/var/lib/openhop_repeater`            | Internal link to `/data` used by openHop Repeater                          |
+| `/opt/openhop_repeater/venv`           | Internal link to `/data/venv` used by the updater                          |
 
 A legacy `/data/.update_channel` file left behind by older app versions is
 ignored.
@@ -222,6 +236,16 @@ Source installation requires:
 
 A failed installation stops the app instead of starting other code. Review
 the complete installation error in the app log before retrying.
+
+### The startup version check fails
+
+Startup verifies that the installed sources are the newest upstream
+versions of the configured refs. This needs HTTPS access to the GitHub API
+in addition to `git`/`pip` access. When the check cannot run, the app logs
+`could not check upstream for a newer version` and starts the previously
+verified installed source; the next startup re-checks automatically. A
+warning that an upstream commit could not be recorded after a successful
+install is handled the same way.
 
 ### The app does not start after editing `config.yaml`
 

@@ -8,6 +8,8 @@ import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -16,7 +18,10 @@ _PR_BARE_NUMBER = re.compile(r"^(\d+)$")
 _PR_HASHED_NUMBER = re.compile(r"^#(\d+)$")
 _PR_PREFIXED_NUMBER = re.compile(r"(?i)^pr[\s#\-_]*#?[\s#\-_]*(\d+)$")
 _PR_REF = re.compile(r"(?i)^(?:refs/)?pull/(\d+)(?:/(head|merge))?$")
+_COMMIT_ID = re.compile(r"^[0-9a-f]{40}$")
 _OPTIONS_DEFAULT_PATH = Path("/data/options.json")
+_DEFAULT_API_BASE = "https://api.github.com"
+_API_BASE_ENV = "OPENHOP_ADDON_GITHUB_API_BASE"
 
 # Per-package source configuration. ``default`` is selected when the option
 # is missing or empty; ``allow_empty`` marks options where an empty value is
@@ -302,6 +307,95 @@ def installed_ref(site_packages: Path, package: str = "repeater") -> str:
     return ""
 
 
+def installed_commit(site_packages: Path, package: str = "repeater") -> str:
+    """Return the installed VCS commit id for the newest installed distribution."""
+    allowed_urls = _package(package)["repo_urls"]
+    assert isinstance(allowed_urls, frozenset)
+    for direct_url_path in _candidate_direct_urls(site_packages, package):
+        try:
+            data = json.loads(direct_url_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        url = str(data.get("url", "")).lower().rstrip("/")
+        if url not in allowed_urls:
+            continue
+
+        vcs_info = data.get("vcs_info")
+        if not isinstance(vcs_info, dict) or vcs_info.get("vcs") != "git":
+            continue
+
+        commit_id = vcs_info.get("commit_id")
+        if isinstance(commit_id, str) and _COMMIT_ID.fullmatch(commit_id):
+            return commit_id
+    return ""
+
+
+def _api_base() -> str:
+    return (os.environ.get(_API_BASE_ENV) or _DEFAULT_API_BASE).rstrip("/")
+
+
+def _repo_slug(package: str) -> str:
+    """Derive the ``owner/repo`` GitHub slug for a package."""
+    urls = _package(package)["repo_urls"]
+    assert isinstance(urls, frozenset)
+    url = sorted(urls)[0]
+    slug = url.removeprefix("https://github.com/").removesuffix(".git")
+    if not slug or "/" not in slug:
+        raise ValueError(f"cannot derive the repository for package {package!r}")
+    return slug
+
+
+def latest_commit(package: str, ref: str) -> str:
+    """Return the newest upstream commit id for a branch or pull-request ref.
+
+    The ref is resolved through the GitHub REST API so startup can verify
+    that an installed source is still the newest version of the configured
+    branch or pull request. ``OPENHOP_ADDON_GITHUB_API_BASE`` can redirect
+    the lookup to another endpoint (used by the test suite). Raises OSError
+    when the ref cannot be resolved, for example because the network is
+    unavailable; callers should treat that as "unknown" rather than as a
+    failed installation.
+    """
+    if not is_valid_source_ref(ref):
+        raise ValueError(f"invalid source ref {ref!r}")
+
+    slug = _repo_slug(package)
+    pull = _PR_REF.fullmatch(ref)
+    if pull:
+        url = f"{_api_base()}/repos/{slug}/pulls/{pull.group(1)}"
+    else:
+        url = f"{_api_base()}/repos/{slug}/commits/{ref}"
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "openhop-ha-add-on",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise OSError(f"upstream returned HTTP {error.code} for {url}") from error
+    except (OSError, ValueError) as error:
+        raise OSError(
+            f"cannot resolve the upstream commit for {url}: {error}"
+        ) from error
+
+    sha = ""
+    if pull:
+        head = body.get("head") if isinstance(body, dict) else None
+        if isinstance(head, dict):
+            sha = str(head.get("sha") or "")
+    elif isinstance(body, dict):
+        sha = str(body.get("sha") or "")
+    if not _COMMIT_ID.fullmatch(sha):
+        raise OSError(f"unexpected upstream response for {url}")
+    return sha
+
+
 def are_safe_pip_args(args: list[str]) -> bool:
     """Allow only version checks and the branch-update commands the app issues."""
     if args in (["--version"], ["-V"]):
@@ -367,6 +461,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default="repeater",
     )
 
+    installed_commit_parser = subparsers.add_parser("installed-commit")
+    installed_commit_parser.add_argument("site_packages", type=Path)
+    installed_commit_parser.add_argument(
+        "--package",
+        dest="package",
+        choices=sorted(_PACKAGES),
+        default="repeater",
+    )
+
+    latest_commit_parser = subparsers.add_parser("latest-commit")
+    latest_commit_parser.add_argument(
+        "--package",
+        dest="package",
+        choices=sorted(_PACKAGES),
+        default="repeater",
+    )
+    latest_commit_parser.add_argument("ref")
+
     install_spec_parser = subparsers.add_parser("install-spec")
     install_spec_parser.add_argument(
         "--package",
@@ -407,6 +519,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "installed-ref":
         print(installed_ref(args.site_packages, args.package))
+        return 0
+    if args.command == "installed-commit":
+        print(installed_commit(args.site_packages, args.package))
+        return 0
+    if args.command == "latest-commit":
+        try:
+            print(latest_commit(args.package, args.ref))
+        except (ValueError, OSError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
         return 0
     if args.command == "install-spec":
         if not is_valid_source_ref(args.ref):

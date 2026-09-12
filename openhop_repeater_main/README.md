@@ -4,6 +4,8 @@ Run openHop Repeater as a Home Assistant app with:
 
 - a complete YAML configuration file;
 - branch or pull-request selection from the app Configuration tab;
+- a startup check that the configured repeater and core refs are the newest
+  upstream versions, updating before start when a branch or PR has moved;
 - persistent source and runtime data;
 - verification that the requested source is the package Python actually imports;
 - refusal to start when the requested source cannot be installed and verified;

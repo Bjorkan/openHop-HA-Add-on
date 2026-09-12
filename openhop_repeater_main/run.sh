@@ -83,6 +83,8 @@ VENV_DIR="${DATA_DIR}/venv"
 PYTHON_MARKER="${VENV_DIR}/.openhop-ha-python"
 BRANCH_MARKER="${VENV_DIR}/.openhop-ha-branch"
 CORE_MARKER="${VENV_DIR}/.openhop-ha-core"
+SOURCE_COMMIT_MARKER="${VENV_DIR}/.openhop-ha-source-commit"
+CORE_COMMIT_MARKER="${VENV_DIR}/.openhop-ha-core-commit"
 OPTIONS_FILE="${OPENHOP_ADDON_OPTIONS_FILE:-/data/options.json}"
 LEGACY_CHANNEL_FILE="${DATA_DIR}/.update_channel"
 
@@ -550,6 +552,67 @@ clear_core_marker() {
     rm -f "${CORE_MARKER}"
 }
 
+is_commit_id() {
+    value="$1"
+    [ "${#value}" -eq 40 ] || return 1
+    case "${value}" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    return 0
+}
+
+read_commit_marker() {
+    marker_file="$1"
+    marker_commit=""
+    if [ -r "${marker_file}" ]; then
+        marker_commit="$(head -n 1 "${marker_file}" 2>/dev/null | tr -d '\r\n' || true)"
+        if ! is_commit_id "${marker_commit}"; then
+            warn "discarding invalid installed-commit marker '${marker_commit}'"
+            marker_commit=""
+            rm -f "${marker_file}"
+        fi
+    fi
+    printf '%s\n' "${marker_commit}"
+}
+
+write_commit_marker() {
+    marker_file="$1"
+    marker_commit="$2"
+    marker_tmp="${marker_file}.tmp.$$"
+    if ! printf '%s\n' "${marker_commit}" > "${marker_tmp}" \
+        || ! mv -f "${marker_tmp}" "${marker_file}"; then
+        rm -f "${marker_tmp}"
+        fatal "could not persist verified source commit '${marker_commit}'"
+    fi
+}
+
+# Resolve the newest upstream commit of a configured ref. The helper prints
+# its own error to stderr on failure; the caller decides what a failed lookup
+# means. This app exists to test upstream PRs, so startup always verifies
+# that the installed code is the newest version of the requested ref.
+latest_upstream_commit() {
+    package="$1"
+    ref="$2"
+    "${SYSTEM_PYTHON}" "${BRANCH_HELPER}" latest-commit --package "${package}" "${ref}"
+}
+
+# Record the upstream commit a verified installation corresponds to. The
+# next startup compares this marker with the ref's current upstream head to
+# detect branches and PRs that gained new commits. When the lookup fails the
+# marker is removed so the next startup falls back to the distribution
+# metadata instead of trusting a stale record.
+record_verified_commit() {
+    package="$1"
+    ref="$2"
+    marker_file="$3"
+    if verified_commit="$(latest_upstream_commit "${package}" "${ref}")"; then
+        write_commit_marker "${marker_file}" "${verified_commit}"
+    else
+        rm -f "${marker_file}"
+        warn "could not record the upstream commit for '${ref}'; the next startup re-checks it"
+    fi
+}
+
 can_import_repeater() {
     "${VENV_PYTHON}" -c 'import repeater.main' >/dev/null 2>&1
 }
@@ -648,6 +711,32 @@ elif [ "${INSTALLED_BRANCH}" != "${SELECTED_BRANCH}" ] \
     NEEDS_BRANCH_INSTALL=true
 fi
 
+# This app exists to test upstream changes, so every startup must confirm
+# that the installed source is the newest version of the requested ref.
+# Branches and pull requests gain new commits while the app keeps running an
+# older verified copy: compare the recorded upstream commit with the ref's
+# current head and reinstall before starting when it moved. The packaged
+# main runtime has no upstream commit to compare and is refreshed through
+# app image updates. A failed lookup never starts other code: startup
+# continues with the verified installed source after a warning.
+if [ "${NEEDS_BRANCH_INSTALL}" != "true" ] && [ "${RUNTIME_FROM_VENV}" = "true" ]; then
+    if LATEST_SOURCE_COMMIT="$(latest_upstream_commit repeater "${SELECTED_BRANCH}")"; then
+        INSTALLED_SOURCE_COMMIT="$(read_commit_marker "${SOURCE_COMMIT_MARKER}")"
+        if [ -z "${INSTALLED_SOURCE_COMMIT}" ]; then
+            INSTALLED_SOURCE_COMMIT="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" installed-commit --package repeater "${VENV_SITE_PACKAGES}")" \
+                || fatal "could not read the installed source commit"
+        fi
+        if [ "${INSTALLED_SOURCE_COMMIT}" != "${LATEST_SOURCE_COMMIT}" ]; then
+            log "newer version of '${SELECTED_BRANCH}' is available upstream (${LATEST_SOURCE_COMMIT}); updating before start"
+            NEEDS_BRANCH_INSTALL=true
+        else
+            write_commit_marker "${SOURCE_COMMIT_MARKER}" "${LATEST_SOURCE_COMMIT}"
+        fi
+    else
+        warn "could not check upstream for a newer version of '${SELECTED_BRANCH}'; continuing with the verified installed source"
+    fi
+fi
+
 if [ "${NEEDS_BRANCH_INSTALL}" = "true" ]; then
     log "installing requested source '${SELECTED_BRANCH}' from ${UPSTREAM_GIT_URL}"
     INSTALL_SPEC="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" install-spec --package repeater "${SELECTED_BRANCH}")" \
@@ -663,6 +752,7 @@ if [ "${NEEDS_BRANCH_INSTALL}" = "true" ]; then
             INSTALLED_BRANCH="${SELECTED_BRANCH}"
             INSTALL_VERIFIED=true
             log "installed and verified source '${SELECTED_BRANCH}'"
+            record_verified_commit repeater "${SELECTED_BRANCH}" "${SOURCE_COMMIT_MARKER}"
         else
             fail_source_install "${SELECTED_BRANCH}" "runtime verification failed"
         fi
@@ -672,6 +762,18 @@ if [ "${NEEDS_BRANCH_INSTALL}" = "true" ]; then
 
     if [ "${INSTALL_VERIFIED}" != "true" ]; then
         fail_source_install "${SELECTED_BRANCH}" "installation could not be verified"
+    fi
+
+    # A repeater reinstall also reinstalls its pinned core dependency and can
+    # replace a previously verified core override. Re-read the core metadata
+    # and drop a stale marker so the core section below reinstalls the
+    # requested override instead of trusting a record that no longer matches
+    # the installed code.
+    DETECTED_CORE="$(detected_installed_core)"
+    if [ -n "${SELECTED_CORE_REF}" ] && [ "${DETECTED_CORE}" != "${SELECTED_CORE_REF}" ]; then
+        clear_core_marker
+        rm -f "${CORE_COMMIT_MARKER}"
+        MARKED_CORE=""
     fi
 fi
 
@@ -688,12 +790,27 @@ NEEDS_CORE_INSTALL=false
 if [ -z "${SELECTED_CORE_REF}" ]; then
     if [ -n "${INSTALLED_CORE}" ]; then
         clear_core_marker
+        rm -f "${CORE_COMMIT_MARKER}"
         INSTALLED_CORE=""
         MARKED_CORE=""
         DETECTED_CORE=""
     fi
 elif [ "${INSTALLED_CORE}" != "${SELECTED_CORE_REF}" ]; then
     NEEDS_CORE_INSTALL=true
+elif ! LATEST_CORE_COMMIT="$(latest_upstream_commit core "${SELECTED_CORE_REF}")"; then
+    warn "could not check upstream for a newer version of openhop_core '${SELECTED_CORE_REF}'; continuing with the verified installed core"
+else
+    INSTALLED_CORE_COMMIT="$(read_commit_marker "${CORE_COMMIT_MARKER}")"
+    if [ -z "${INSTALLED_CORE_COMMIT}" ]; then
+        INSTALLED_CORE_COMMIT="$("${SYSTEM_PYTHON}" "${BRANCH_HELPER}" installed-commit --package core "${VENV_SITE_PACKAGES}")" \
+            || fatal "could not read the installed openhop_core commit"
+    fi
+    if [ "${INSTALLED_CORE_COMMIT}" != "${LATEST_CORE_COMMIT}" ]; then
+        log "newer version of openhop_core '${SELECTED_CORE_REF}' is available upstream (${LATEST_CORE_COMMIT}); updating before start"
+        NEEDS_CORE_INSTALL=true
+    else
+        write_commit_marker "${CORE_COMMIT_MARKER}" "${LATEST_CORE_COMMIT}"
+    fi
 fi
 
 if [ "${NEEDS_CORE_INSTALL}" = "true" ]; then
@@ -710,6 +827,7 @@ if [ "${NEEDS_CORE_INSTALL}" = "true" ]; then
             INSTALLED_CORE="${SELECTED_CORE_REF}"
             CORE_VERIFIED=true
             log "installed and verified openhop_core source '${SELECTED_CORE_REF}'"
+            record_verified_commit core "${SELECTED_CORE_REF}" "${CORE_COMMIT_MARKER}"
         else
             fail_core_install "${SELECTED_CORE_REF}" "runtime verification failed"
         fi
@@ -756,6 +874,9 @@ fi
 ACTIVE_VERSION="$("${VENV_PYTHON}" -c 'import repeater; print(getattr(repeater, "__version__", "unknown"))')"
 log "selected source: ${SELECTED_BRANCH}; active source: ${ACTIVE_BRANCH}; version: ${ACTIVE_VERSION}"
 log "selected core: ${SELECTED_CORE_REF:-<pinned>}; active core: ${ACTIVE_CORE}"
+ACTIVE_SOURCE_COMMIT="$(read_commit_marker "${SOURCE_COMMIT_MARKER}")"
+ACTIVE_CORE_COMMIT="$(read_commit_marker "${CORE_COMMIT_MARKER}")"
+log "verified source commit: ${ACTIVE_SOURCE_COMMIT:-unknown}; verified core commit: ${ACTIVE_CORE_COMMIT:-unknown}"
 log "runtime package: ${IMPORT_PATH}"
 
 replace_directory_with_symlink "${RUNTIME_CONFIG_DIR}" "${ADDON_CONFIG_DIR}" false

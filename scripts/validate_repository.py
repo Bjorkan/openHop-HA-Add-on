@@ -184,6 +184,11 @@ def validate_app(app: Path) -> str:
         "OPENHOP_ADDON_CONFIG_HELPER",
         "OPENHOP_ADDON_RUNTIME_INFO_HELPER",
         "refusing to start with other code",
+        "latest-commit",
+        "installed-commit",
+        "SOURCE_COMMIT_MARKER",
+        "CORE_COMMIT_MARKER",
+        "record_verified_commit",
     ):
         if required_fragment not in run_text:
             fail(
@@ -238,6 +243,8 @@ def validate_app(app: Path) -> str:
         "desired-ref",
         "install-spec",
         "installed-ref",
+        "installed-commit",
+        "latest-commit",
         "validate-source",
     ):
         if required_fragment not in helper_source:
@@ -251,15 +258,10 @@ def validate_app(app: Path) -> str:
     configuration = translations.get("configuration")
     for option_key in ("branch_or_pr", "core_branch_or_pr"):
         label = (
-            configuration.get(option_key)
-            if isinstance(configuration, dict)
-            else None
+            configuration.get(option_key) if isinstance(configuration, dict) else None
         )
         if not isinstance(label, dict) or not label.get("name"):
-            fail(
-                f"{app.name}/translations/en.yaml must name the "
-                f"{option_key} option"
-            )
+            fail(f"{app.name}/translations/en.yaml must name the {option_key} option")
 
     invalid_terms = ("app_config", "app_configs")
     text_files = [

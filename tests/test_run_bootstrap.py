@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 
 import yaml
+from fake_github_api import FakeGitHubApi, commit_body, pull_body
 
 ROOT = Path(__file__).resolve().parents[1]
 ADDON = ROOT / "openhop_repeater_main"
@@ -116,6 +117,9 @@ def base_bootstrap_env(
             "OPENHOP_ADDON_BUILD_VERSION": "3.2.0",
             "OPENHOP_ADDON_OPTIONS_FILE": str(options_file),
             "OPENHOP_ADDON_YQ": str(root / "missing-yq"),
+            # Keep existing tests hermetic: a closed loopback port makes the
+            # startup version check fail fast without touching the network.
+            "OPENHOP_ADDON_GITHUB_API_BASE": "http://127.0.0.1:1",
         }
     )
     return env
@@ -128,6 +132,87 @@ def write_options(root: Path, value: object, core_value: object = "") -> Path:
         encoding="utf-8",
     )
     return options_file
+
+
+def write_install_fake_pip(root: Path, active_marker: str) -> Path:
+    """Write a pip stand-in that records calls and installs runnable sources."""
+    fake_pip = root / "fake-pip"
+    fake_pip.write_text(
+        textwrap.dedent(
+            r"""
+            #!/usr/bin/python3
+            import json
+            import os
+            import pathlib
+            import sys
+
+            root = pathlib.Path(os.environ["OPENHOP_TEST_ROOT"])
+            with (root / "pip-calls.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(sys.argv[1:]) + "\n")
+            site = next(
+                (root / "data" / "venv" / "lib").glob("python*/site-packages")
+            )
+            spec = sys.argv[-1]
+            revision = spec.rsplit("@", 1)[-1]
+            if spec.startswith("openhop_repeater"):
+                url = "https://github.com/openhop-dev/openhop_repeater.git"
+                package = site / "repeater"
+                package.mkdir(parents=True, exist_ok=True)
+                (package / "__init__.py").write_text(
+                    "__version__ = 'dev-test'\n", encoding="utf-8"
+                )
+                (package / "main.py").write_text(
+                    "import os, pathlib, time\n"
+                    "def main():\n"
+                    "    root = pathlib.Path("
+                    "os.environ['OPENHOP_TEST_ROOT'])\n"
+                    "    (root / 'child-pid').write_text("
+                    "str(os.getpid()), encoding='utf-8')\n"
+                    "    (root / '__OPENHOP_ACTIVE_MARKER__').write_text("
+                    "'yes', encoding='utf-8')\n"
+                    "    while True: time.sleep(1)\n"
+                    "if __name__ == '__main__': main()\n",
+                    encoding="utf-8",
+                )
+                dist_name = "openhop_repeater-1.0.0.dist-info"
+            else:
+                url = "https://github.com/openhop-dev/openhop_core.git"
+                dist_name = "openhop_core-1.0.0.dist-info"
+            dist_info = site / dist_name
+            dist_info.mkdir(parents=True, exist_ok=True)
+            (dist_info / "METADATA").write_text(
+                "Metadata-Version: 2.1\n", encoding="utf-8"
+            )
+            (dist_info / "direct_url.json").write_text(
+                json.dumps(
+                    {
+                        "url": url,
+                        "vcs_info": {
+                            "vcs": "git",
+                            "requested_revision": revision,
+                            "commit_id": "a" * 40,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            """
+        )
+        .lstrip()
+        .replace("__OPENHOP_ACTIVE_MARKER__", active_marker),
+        encoding="utf-8",
+    )
+    fake_pip.chmod(0o755)
+    return fake_pip
+
+
+def read_pip_calls(root: Path) -> list[list[str]]:
+    calls_file = root / "pip-calls.jsonl"
+    if not calls_file.exists():
+        return []
+    return [
+        json.loads(line) for line in calls_file.read_text(encoding="utf-8").splitlines()
+    ]
 
 
 def run_bootstrap_until_marker(
@@ -991,6 +1076,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
                     "OPENHOP_ADDON_BUILD_VERSION": "3.2.0",
                     "OPENHOP_ADDON_BASE_IMAGE_ID_FILE": str(base_image_id),
                     "OPENHOP_ADDON_OPTIONS_FILE": str(root / "options.json"),
+                    "OPENHOP_ADDON_GITHUB_API_BASE": "http://127.0.0.1:1",
                     "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER": (
                         "1.1.2.dev1"
                     ),
@@ -1535,6 +1621,167 @@ class BootstrapIntegrationTests(unittest.TestCase):
             self.assertIn("could not generate unique credentials", result.stderr)
             self.assertFalse((root / "config" / "config.yaml").exists())
             self.assertEqual(list((root / "config").glob("config.yaml.tmp.*")), [])
+
+
+class StartupVersionCheckTests(unittest.TestCase):
+    """Startup must always run the newest version of the configured refs."""
+
+    COMMIT_A = "a" * 40
+    COMMIT_B = "b" * 40
+
+    def _prepare_root(self, root: Path) -> None:
+        for directory in ("config", "data", "etc", "var", "opt"):
+            (root / directory).mkdir()
+        (root / "config" / "config.yaml").write_text(
+            "repeater:\n  node_name: update-check-test\nradio_type: null\n",
+            encoding="utf-8",
+        )
+
+    def _reset_child_markers(self, root: Path, marker_name: str) -> None:
+        for name in (marker_name, "child-pid"):
+            marker = root / name
+            if marker.exists():
+                marker.unlink()
+
+    def test_startup_updates_branch_when_upstream_moves(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="openhop-addon-fresh-") as temp_dir:
+            root = Path(temp_dir)
+            self._prepare_root(root)
+            write_options(root, "dev")
+            base_runtime = create_packaged_runtime(root)
+            fake_pip = write_install_fake_pip(root, "dev-active")
+
+            repeater_dev = "/repos/openhop-dev/openhop_repeater/commits/dev"
+            api = FakeGitHubApi({repeater_dev: (200, commit_body(self.COMMIT_A))})
+            try:
+                env = base_bootstrap_env(root, base_runtime, fake_pip)
+                env["OPENHOP_ADDON_GITHUB_API_BASE"] = api.base_url
+                run_bootstrap_until_marker(self, root, env, "dev-active")
+
+                self.assertEqual(len(read_pip_calls(root)), 1)
+                self.assertEqual(
+                    (root / "data" / "venv" / ".openhop-ha-source-commit").read_text(
+                        encoding="utf-8"
+                    ),
+                    self.COMMIT_A + "\n",
+                )
+
+                # Upstream dev gains a new commit. The next startup must
+                # detect it and reinstall the branch before starting.
+                api.api_responses[repeater_dev] = (
+                    200,
+                    commit_body(self.COMMIT_B),
+                )
+                self._reset_child_markers(root, "dev-active")
+                output = run_bootstrap_until_marker(self, root, env, "dev-active")
+
+                calls = read_pip_calls(root)
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(calls[1][-1].endswith("@dev"))
+                self.assertIn("newer version of 'dev' is available upstream", output)
+                self.assertIn(f"({self.COMMIT_B}); updating before start", output)
+                self.assertEqual(
+                    (root / "data" / "venv" / ".openhop-ha-source-commit").read_text(
+                        encoding="utf-8"
+                    ),
+                    self.COMMIT_B + "\n",
+                )
+                self.assertIn(f"verified source commit: {self.COMMIT_B}", output)
+            finally:
+                api.close()
+
+    def test_startup_check_failure_continues_with_installed_source(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="openhop-addon-fresh-offline-"
+        ) as temp_dir:
+            root = Path(temp_dir)
+            self._prepare_root(root)
+            write_options(root, "dev")
+            base_runtime = create_packaged_runtime(root)
+            fake_pip = write_install_fake_pip(root, "dev-active")
+
+            repeater_dev = "/repos/openhop-dev/openhop_repeater/commits/dev"
+            api = FakeGitHubApi({repeater_dev: (200, commit_body(self.COMMIT_A))})
+            try:
+                env = base_bootstrap_env(root, base_runtime, fake_pip)
+                env["OPENHOP_ADDON_GITHUB_API_BASE"] = api.base_url
+                run_bootstrap_until_marker(self, root, env, "dev-active")
+            finally:
+                api.close()
+
+            # The version check cannot reach upstream (for example while the
+            # network is down). Startup must continue with the verified
+            # installed source instead of reinstalling or starting other code.
+            env["OPENHOP_ADDON_GITHUB_API_BASE"] = "http://127.0.0.1:1"
+            self._reset_child_markers(root, "dev-active")
+            output = run_bootstrap_until_marker(self, root, env, "dev-active")
+
+            self.assertEqual(len(read_pip_calls(root)), 1)
+            self.assertIn(
+                "could not check upstream for a newer version of 'dev'",
+                output,
+            )
+            self.assertIn("continuing with the verified installed source", output)
+            self.assertIn("selected source: dev; active source: dev", output)
+
+    def test_startup_updates_core_override_when_upstream_moves(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="openhop-addon-core-fresh-"
+        ) as temp_dir:
+            root = Path(temp_dir)
+            self._prepare_root(root)
+            write_options(root, "dev", 7)
+            base_runtime = create_packaged_runtime(root)
+            fake_pip = write_install_fake_pip(root, "core-active")
+
+            repeater_dev = "/repos/openhop-dev/openhop_repeater/commits/dev"
+            core_pr = "/repos/openhop-dev/openhop_core/pulls/7"
+            api = FakeGitHubApi(
+                {
+                    repeater_dev: (200, commit_body(self.COMMIT_A)),
+                    core_pr: (200, pull_body(self.COMMIT_A)),
+                }
+            )
+            try:
+                env = base_bootstrap_env(root, base_runtime, fake_pip)
+                env["OPENHOP_ADDON_GITHUB_API_BASE"] = api.base_url
+                run_bootstrap_until_marker(self, root, env, "core-active")
+
+                calls = read_pip_calls(root)
+                self.assertEqual(len(calls), 2)
+                self.assertIn("openhop_repeater", calls[0][-1])
+                self.assertTrue(calls[1][-1].endswith("@refs/pull/7/head"))
+                self.assertEqual(
+                    (root / "data" / "venv" / ".openhop-ha-core-commit").read_text(
+                        encoding="utf-8"
+                    ),
+                    self.COMMIT_A + "\n",
+                )
+
+                # The pull request gains a new commit. The next startup keeps
+                # the fresh repeater install and only reinstalls core.
+                api.api_responses[core_pr] = (200, pull_body(self.COMMIT_B))
+                self._reset_child_markers(root, "core-active")
+                output = run_bootstrap_until_marker(self, root, env, "core-active")
+
+                calls = read_pip_calls(root)
+                self.assertEqual(len(calls), 3)
+                self.assertIn("openhop_core", calls[2][-1])
+                self.assertTrue(calls[2][-1].endswith("@refs/pull/7/head"))
+                self.assertIn(
+                    "newer version of openhop_core 'refs/pull/7/head' "
+                    "is available upstream",
+                    output,
+                )
+                self.assertIn(f"verified core commit: {self.COMMIT_B}", output)
+                self.assertEqual(
+                    (root / "data" / "venv" / ".openhop-ha-core-commit").read_text(
+                        encoding="utf-8"
+                    ),
+                    self.COMMIT_B + "\n",
+                )
+            finally:
+                api.close()
 
 
 if __name__ == "__main__":

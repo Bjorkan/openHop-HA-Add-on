@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fake_github_api import FakeGitHubApi, commit_body, pull_body
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = (
     ROOT
@@ -553,6 +555,212 @@ class InstalledRefTests(unittest.TestCase):
             self._write_direct_url(root, "2.0.0", "dev", 2, vcs="hg")
             self._write_direct_url(root, "1.0.0", "unsafe ref", 1)
             self.assertEqual(branch_state.installed_ref(root), "")
+
+
+class InstalledCommitTests(unittest.TestCase):
+    def _write_direct_url(
+        self,
+        root: Path,
+        name: str,
+        revision: str,
+        commit_id: str,
+        mtime: int,
+        *,
+        url: str = "https://github.com/openhop-dev/openhop_repeater.git",
+    ) -> None:
+        target = root / f"openhop_repeater-{name}.dist-info" / "direct_url.json"
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            json.dumps(
+                {
+                    "url": url,
+                    "vcs_info": {
+                        "vcs": "git",
+                        "requested_revision": revision,
+                        "commit_id": commit_id,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.utime(target, ns=(mtime, mtime))
+
+    def test_returns_newest_distribution_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_direct_url(root, "1.0.0", "main", "a" * 40, 1)
+            self._write_direct_url(root, "2.0.0", "dev", "b" * 40, 2)
+            self.assertEqual(branch_state.installed_commit(root), "b" * 40)
+
+    def test_returns_empty_for_missing_or_malformed_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.assertEqual(branch_state.installed_commit(root), "")
+            self._write_direct_url(root, "1.0.0", "dev", "not-a-commit", 1)
+            self.assertEqual(branch_state.installed_commit(root), "")
+            self._write_direct_url(
+                root,
+                "2.0.0",
+                "dev",
+                "c" * 40,
+                2,
+                url="https://example.invalid/openhop_repeater.git",
+            )
+            self.assertEqual(branch_state.installed_commit(root), "")
+
+    def test_supports_core_distributions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "openhop_core-1.0.0.dist-info" / "direct_url.json"
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                json.dumps(
+                    {
+                        "url": "https://github.com/openhop-dev/openhop_core.git",
+                        "vcs_info": {
+                            "vcs": "git",
+                            "requested_revision": "refs/pull/7/head",
+                            "commit_id": "d" * 40,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(branch_state.installed_commit(root, "core"), "d" * 40)
+            self.assertEqual(branch_state.installed_commit(root), "")
+
+
+class LatestCommitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_base = os.environ.get("OPENHOP_ADDON_GITHUB_API_BASE")
+        os.environ.pop("OPENHOP_ADDON_GITHUB_API_BASE", None)
+
+    def tearDown(self) -> None:
+        if self._old_base is None:
+            os.environ.pop("OPENHOP_ADDON_GITHUB_API_BASE", None)
+        else:
+            os.environ["OPENHOP_ADDON_GITHUB_API_BASE"] = self._old_base
+
+    def test_resolves_branch_head_through_commits_endpoint(self) -> None:
+        api = FakeGitHubApi(
+            {
+                "/repos/openhop-dev/openhop_repeater/commits/dev": (
+                    200,
+                    commit_body("a" * 40),
+                )
+            }
+        )
+        try:
+            os.environ["OPENHOP_ADDON_GITHUB_API_BASE"] = api.base_url
+            self.assertEqual(branch_state.latest_commit("repeater", "dev"), "a" * 40)
+        finally:
+            api.close()
+
+    def test_resolves_pull_requests_through_the_pulls_endpoint(self) -> None:
+        api = FakeGitHubApi(
+            {
+                "/repos/openhop-dev/openhop_core/pulls/7": (
+                    200,
+                    pull_body("b" * 40),
+                )
+            }
+        )
+        try:
+            os.environ["OPENHOP_ADDON_GITHUB_API_BASE"] = api.base_url
+            for ref in ("refs/pull/7/head", "refs/pull/7/merge"):
+                with self.subTest(ref=ref):
+                    self.assertEqual(branch_state.latest_commit("core", ref), "b" * 40)
+        finally:
+            api.close()
+
+    def test_http_and_network_failures_raise_oserror(self) -> None:
+        api = FakeGitHubApi(
+            {"/repos/openhop-dev/openhop_repeater/commits/dev": (404, "{}")}
+        )
+        try:
+            os.environ["OPENHOP_ADDON_GITHUB_API_BASE"] = api.base_url
+            with self.assertRaises(OSError):
+                branch_state.latest_commit("repeater", "dev")
+        finally:
+            api.close()
+
+        # A closed loopback port fails fast without touching the network.
+        os.environ["OPENHOP_ADDON_GITHUB_API_BASE"] = "http://127.0.0.1:1"
+        with self.assertRaises(OSError):
+            branch_state.latest_commit("repeater", "dev")
+
+    def test_malformed_upstream_responses_raise_oserror(self) -> None:
+        for body in ('{"sha": "short"}', "{}", '{"head": {}}', "not-json"):
+            with self.subTest(body=body):
+                api = FakeGitHubApi(
+                    {
+                        "/repos/openhop-dev/openhop_repeater/commits/dev": (
+                            200,
+                            body,
+                        )
+                    }
+                )
+                try:
+                    os.environ["OPENHOP_ADDON_GITHUB_API_BASE"] = api.base_url
+                    with self.assertRaises(OSError):
+                        branch_state.latest_commit("repeater", "dev")
+                finally:
+                    api.close()
+
+    def test_invalid_refs_raise_valueerror(self) -> None:
+        for ref in ("", "42", "#42", "pull/42/head", "feature..topic"):
+            with self.subTest(ref=ref):
+                with self.assertRaises(ValueError):
+                    branch_state.latest_commit("repeater", ref)
+
+    def test_cli_prints_commit_and_fails_with_stderr_message(self) -> None:
+        api = FakeGitHubApi(
+            {
+                "/repos/openhop-dev/openhop_core/pulls/7": (
+                    200,
+                    pull_body("c" * 40),
+                )
+            }
+        )
+        try:
+            env = os.environ.copy()
+            env["OPENHOP_ADDON_GITHUB_API_BASE"] = api.base_url
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "latest-commit",
+                    "--package",
+                    "core",
+                    "refs/pull/7/head",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "c" * 40)
+
+            env["OPENHOP_ADDON_GITHUB_API_BASE"] = "http://127.0.0.1:1"
+            failure = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "latest-commit",
+                    "dev",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(failure.returncode, 1)
+            self.assertIn("cannot resolve", failure.stderr)
+        finally:
+            api.close()
 
 
 if __name__ == "__main__":

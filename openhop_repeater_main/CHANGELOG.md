@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.3.0
+
+### Startup version checks for branches and PRs
+
+- On every startup, the app resolves the newest upstream commit of the
+  configured `branch_or_pr` and `core_branch_or_pr` refs through the GitHub
+  API and reinstalls the source before starting when the branch or pull
+  request has gained new commits. A pull request is always run at its
+  current head, so this app never keeps testing an outdated PR version.
+- The verified upstream commit of each installed source is stored in
+  `/data/venv/.openhop-ha-source-commit` and
+  `/data/venv/.openhop-ha-core-commit` and is reported in the startup log.
+- When the upstream check cannot run (for example while the network is
+  down), startup continues with the previously verified installed source
+  after a warning instead of starting other code.
+- A repeater reinstall reinstalls its pinned core dependency and can
+  replace a verified core override; the stale core marker is now discarded so
+  the requested core override is reinstalled on the same startup.
+
 ## 3.2.0
 
 ### Core branch / PR override
